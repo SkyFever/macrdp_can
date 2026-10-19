@@ -97,7 +97,17 @@ impl Encoder {
         // Keyframe interval is a frame count; derive it from the requested
         // seconds and the frame rate. At least 1 (every frame an IDR).
         let keyframe_frames = (f64::from(fps) * f64::from(keyframe_secs)).round().max(1.0) as u32;
-        let session = ffi::create_session(width, height, bitrate_bps, keyframe_frames, tx_ptr)?;
+        // Prefer the dedicated media engine when available. For diagnostics,
+        // MACRDP_REQUIRE_HW_ENCODER=1 fails startup instead of silently using
+        // a software encoder. This affects negotiated EGFX/AVC only; Android
+        // clients advertising AVC_DISABLED still use legacy BitmapUpdate.
+        let require_hardware = matches!(
+            std::env::var("MACRDP_REQUIRE_HW_ENCODER").as_deref(),
+            Ok("1") | Ok("true") | Ok("TRUE")
+        );
+        let session = ffi::create_session(
+            width, height, bitrate_bps, keyframe_frames, tx_ptr, require_hardware,
+        )?;
         Ok(Self {
             inner: session,
             rx: Some(rx),
@@ -301,6 +311,11 @@ mod ffi {
         pub(super) static kVTCompressionPropertyKey_ProfileLevel: CFStringRef;
         pub(super) static kVTCompressionPropertyKey_AllowFrameReordering: CFStringRef;
         pub(super) static kVTCompressionPropertyKey_MaxFrameDelayCount: CFStringRef;
+        // Read back the actual encoder chosen by VideoToolbox. A client-side
+        // acceleration toggle does not prove hardware encoding on this Mac.
+        pub(super) static kVTCompressionPropertyKey_UsingHardwareAcceleratedVideoEncoder: CFStringRef;
+        pub(super) static kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder: CFStringRef;
+        pub(super) static kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder: CFStringRef;
         pub(super) static kVTProfileLevel_H264_Baseline_AutoLevel: CFStringRef;
         pub(super) static kVTEncodeFrameOptionKey_ForceKeyFrame: CFStringRef;
         // Color-space signaling so the encoded SPS VUI describes its color
@@ -316,6 +331,7 @@ mod ffi {
         pub(super) static kCVImageBufferYCbCrMatrix_ITU_R_709_2: CFStringRef;
         pub(super) static kCFBooleanTrue: CFBooleanRef;
         pub(super) static kCFBooleanFalse: CFBooleanRef;
+        pub(super) fn CFBooleanGetValue(boolean: CFBooleanRef) -> Boolean;
 
         // CFDictionary creation for VT frame-properties payloads.
         // `CFDictionaryKeyCallBacks` / `CFDictionaryValueCallBacks` are
@@ -414,6 +430,12 @@ mod ffi {
             property_key: CFStringRef,
             property_value: CFTypeRef,
         ) -> OSStatus;
+        pub(super) fn VTSessionCopyProperty(
+            session: VTCompressionSessionRef,
+            property_key: CFStringRef,
+            allocator: CFAllocatorRef,
+            property_value_out: *mut CFTypeRef,
+        ) -> OSStatus;
         pub(super) fn VTCompressionSessionPrepareToEncodeFrames(
             session: VTCompressionSessionRef,
         ) -> OSStatus;
@@ -459,15 +481,37 @@ mod ffi {
         bitrate_bps: u32,
         keyframe_frames: u32,
         tx_ctx: *mut c_void,
+        require_hardware: bool,
     ) -> Result<SessionGuard> {
         let mut session: VTCompressionSessionRef = ptr::null();
+        // VideoToolbox's default encoder selection is opaque. Express our
+        // hardware preference explicitly, and permit an opt-in hard failure
+        // when validating a Mac's encoder availability.
+        let hw_keys = [
+            unsafe { kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder },
+            unsafe { kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder },
+        ];
+        let hw_values = [unsafe { kCFBooleanTrue }, unsafe { kCFBooleanTrue }];
+        let hw_spec = unsafe {
+            CFDictionaryCreate(
+                ptr::null(),
+                hw_keys.as_ptr(),
+                hw_values.as_ptr(),
+                if require_hardware { 2 } else { 1 },
+                &kCFTypeDictionaryKeyCallBacks as *const _ as *const c_void,
+                &kCFTypeDictionaryValueCallBacks as *const _ as *const c_void,
+            )
+        };
+        if hw_spec.is_null() {
+            bail!("Could not allocate VideoToolbox encoder specification");
+        }
         let status = unsafe {
             VTCompressionSessionCreate(
                 ptr::null(),
                 i32::from(width),
                 i32::from(height),
                 K_CM_VIDEO_CODEC_TYPE_H264,
-                ptr::null(),
+                hw_spec,
                 ptr::null(),
                 ptr::null(),
                 Some(output_callback),
@@ -475,8 +519,11 @@ mod ffi {
                 &mut session,
             )
         };
+        unsafe { CFRelease(hw_spec) };
         if status != 0 || session.is_null() {
-            bail!("VTCompressionSessionCreate failed: OSStatus {status}");
+            bail!(
+                "VTCompressionSessionCreate failed: OSStatus {status} (require_hardware={require_hardware})"
+            );
         }
         let guard = SessionGuard { session };
 
@@ -550,6 +597,38 @@ mod ffi {
         let prepared = unsafe { VTCompressionSessionPrepareToEncodeFrames(session) };
         if prepared != 0 {
             bail!("VTCompressionSessionPrepareToEncodeFrames failed: OSStatus {prepared}");
+        }
+        // The actual hardware usage is reported by VT, not inferred from
+        // process CPU/GPU percentages or from client AVC capabilities.
+        let mut value: CFTypeRef = ptr::null();
+        let status = unsafe {
+            VTSessionCopyProperty(
+                session,
+                kVTCompressionPropertyKey_UsingHardwareAcceleratedVideoEncoder,
+                ptr::null(),
+                &mut value,
+            )
+        };
+        let using_hardware = if status == 0 && !value.is_null() {
+            let enabled = unsafe { CFBooleanGetValue(value) != 0 };
+            Some(enabled)
+        } else {
+            None
+        };
+        if !value.is_null() {
+            unsafe { CFRelease(value) };
+        }
+        tracing::info!(
+            width,
+            height,
+            hardware_required = require_hardware,
+            hardware_accelerated = ?using_hardware,
+            "VideoToolbox H.264 encoder selected"
+        );
+        // If VT provided an authoritative answer, don't report a software
+        // encoder as success when the operator explicitly required hardware.
+        if require_hardware && using_hardware == Some(false) {
+            bail!("VideoToolbox selected software H.264 encoder despite hardware requirement");
         }
         Ok(guard)
     }

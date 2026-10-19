@@ -46,6 +46,18 @@ Short version: **production-ready for single-user use on a LAN or VPN** — soak
 
 Details and the path to closing the gaps: [docs/production-readiness-roadmap.md](docs/production-readiness-roadmap.md).
 
+### Experimental scaled-legacy optimization
+
+When the client advertises `AVC_DISABLED` (observed with some Android Windows
+App versions), the server uses legacy BitmapUpdate even with `--enable-h264`.
+A scaled client resolution no longer forces whole-screen legacy updates on
+*every* change: output-pixel tile damage now limits updates to changed areas.
+To compare against the original path, pass `--no-scaled-delta`. Hardware
+H.264 selection is also logged for AVC-capable clients, with an optional
+`MACRDP_REQUIRE_HW_ENCODER=1` diagnostic. See
+[the performance-patch notes](docs/PERF_PATCH_SCALED_LEGACY.md) for usage,
+limitations, and 45 FPS A/B instructions.
+
 ## Quick start
 
 ```bash

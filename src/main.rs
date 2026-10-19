@@ -16,6 +16,7 @@ mod auth_guard;
 mod avc444;
 mod camera;
 mod capture;
+mod frame_delta;
 mod clipboard;
 mod clipboard_rich;
 #[cfg(test)]
@@ -187,8 +188,8 @@ struct Args {
 
     /// Desktop width in pixels. Defaults to the primary display's native width
     /// (queried via ScreenCaptureKit). Overriding to a non-native size makes
-    /// SCK scale internally; we then disable dirty-rect updates and ship a
-    /// full frame every tick, so bandwidth is higher than at native size.
+    /// SCK scale internally; source-coordinate dirty rects become unreliable.
+    /// The scaled legacy path computes output-pixel tile damage instead.
     #[arg(long)]
     width: Option<u16>,
 
@@ -213,6 +214,13 @@ struct Args {
     /// immediate — at 30fps it lags ~2 keystrokes). Set explicitly to override.
     #[arg(long)]
     fps: Option<u32>,
+
+    /// Disable scaled-legacy output-pixel delta tracking, reverting to the
+    /// original full-frame BitmapUpdate behavior. Diagnostic A/B switch: on
+    /// scaled ScreenCaptureKit sessions the default delta tracking sends only
+    /// changed tiles, regardless of source-coordinate dirty-rect mismatches.
+    #[arg(long)]
+    no_scaled_delta: bool,
 
     /// Cursor size multiplier (default 1.0). At 1.0 the pointer is forwarded at
     /// its native macOS size, matching the cursor on the Mac's own screen with
@@ -3287,6 +3295,7 @@ async fn async_main() -> Result<()> {
         desktop_size: desktop_size.clone(),
         auto_size,
         stretch: args.stretch,
+        scaled_delta_enabled: !args.no_scaled_delta,
         fps,
         display_id: capture_display_id,
         screen_size_pts,
@@ -3780,6 +3789,20 @@ mod lock_on_disconnect_tests {
         let args = super::Args::try_parse_from(["macrdp", "--lock-on-disconnect"]);
         assert!(args.is_ok());
         assert!(args.unwrap().lock_on_disconnect);
+    }
+}
+
+#[cfg(test)]
+mod scaled_legacy_delta_flag_tests {
+    #[test]
+    fn default_enabled_and_ab_opt_out_parses() {
+        use clap::Parser;
+        assert!(!super::Args::try_parse_from(["macrdp"]).unwrap().no_scaled_delta);
+        assert!(
+            super::Args::try_parse_from(["macrdp", "--no-scaled-delta"])
+                .unwrap()
+                .no_scaled_delta
+        );
     }
 }
 

@@ -330,6 +330,9 @@ pub struct CaptureDisplay {
     /// black bars. Only relevant when `auto_size` is scaling to a non-native
     /// aspect; ignored otherwise.
     pub stretch: bool,
+    /// Enable pixel-exact tile damage for scaled legacy clients. Opt out with
+    /// `--no-scaled-delta` to compare against the original full-frame path.
+    pub scaled_delta_enabled: bool,
     pub fps: u32,
     /// `Some(CGDirectDisplayID)` captures that specific display (e.g. a
     /// `VirtualDisplay`); `None` captures the first SCK display, which
@@ -825,6 +828,7 @@ impl CaptureDisplay {
                 self.display_suppressed.clone(),
                 self.auto_size,
                 self.stretch,
+                self.scaled_delta_enabled,
                 self.desktop_size.clone(),
                 self.pending_resize.clone(),
                 self.suppress_next_adopt.clone(),
@@ -924,14 +928,17 @@ mod macos {
         // bitmap cache starts in a known-good state; SCK's dirty rects
         // for frame 0 may not cover everything.
         seeded: bool,
-        // When the configured desktop size differs from the Mac's native
-        // display, SCK scales the output internally but emits dirty rects
-        // in *source* coordinates — they don't line up with the output
-        // buffer. RemoteFx (mstsc) renders the resulting mis-positioned
-        // tile updates as a black canvas. Force a full-frame BitmapUpdate
-        // every tick in that case; the upstream encoder's framebuffer diff
-        // then keeps the actual bandwidth reasonable.
+        // SCK reports source-coordinate dirty rects when scaling. Compare
+        // output pixels against the last enqueued frame instead of treating
+        // every tiny change (e.g. Dock animation) as full-screen damage.
         force_full_frame: bool,
+        scaled_delta: Option<crate::frame_delta::FrameDelta>,
+        // Low-rate diagnostics for scaled legacy BitmapUpdates.
+        delta_last_log: Instant,
+        delta_frames: u64,
+        delta_full: u64,
+        delta_unchanged: u64,
+        delta_rects: u64,
         cursor: CursorState,
         /// Last time the cursor shape was polled (`None` = never → poll
         /// immediately so the client gets its initial pointer). Each poll is a
@@ -1056,6 +1063,7 @@ mod macos {
             display_suppressed: Option<Arc<AtomicBool>>,
             auto_size: bool,
             stretch: bool,
+            scaled_delta_enabled: bool,
             desktop_size: SharedDesktopSize,
             pending_resize: PendingResize,
             suppress_next_adopt: Arc<AtomicBool>,
@@ -1130,9 +1138,9 @@ mod macos {
                     backing_w,
                     backing_h,
                     aspect_mode = if letterbox { "letterbox" } else { "stretch" },
-                    "configured size != native points or backing; SCK dirty rects are in \
-                     source coords and would misalign — sending full frames every tick \
-                     (higher bandwidth)"
+                    scaled_delta_enabled,
+                    "configured size != native points or backing; SCK source-coordinate dirty \
+                     rects are invalid — using output-pixel deltas when enabled"
                 );
             }
 
@@ -1218,6 +1226,13 @@ mod macos {
                 pending: std::collections::VecDeque::new(),
                 seeded: false,
                 force_full_frame,
+                scaled_delta: (force_full_frame && scaled_delta_enabled)
+                    .then(crate::frame_delta::FrameDelta::default),
+                delta_last_log: Instant::now(),
+                delta_frames: 0,
+                delta_full: 0,
+                delta_unchanged: 0,
+                delta_rects: 0,
                 cursor,
                 last_cursor_poll: None,
                 gfx,
@@ -1513,6 +1528,21 @@ mod macos {
                     u16::try_from(guard.height()).context("pixel buffer height > u16")?;
                 let stride_bytes = guard.bytes_per_row();
                 let src = guard.as_slice();
+                let row_bytes = usize::from(pb_width) * 4;
+                let required = usize::from(pb_height)
+                    .checked_sub(1)
+                    .and_then(|rows| rows.checked_mul(stride_bytes))
+                    .and_then(|n| n.checked_add(row_bytes))
+                    .context("capture frame extent overflow")?;
+                if stride_bytes < row_bytes || src.len() < required {
+                    return Err(anyhow!(
+                        "malformed SCK BGRA buffer: {}x{}, stride {}, len {}",
+                        pb_width,
+                        pb_height,
+                        stride_bytes,
+                        src.len()
+                    ));
+                }
 
                 // Log the dimensions SCK actually delivers, once per session.
                 // `pb_width`/`pb_height` are the real captured buffer size — at
@@ -1645,37 +1675,77 @@ mod macos {
                 // After that, SCK's dirty_rects tells us what changed; if the
                 // attachment is missing (older macOS, no key), fall back to
                 // the full frame.
-                let dirty = if !self.seeded || self.force_full_frame {
-                    None
-                } else {
-                    sample.dirty_rects()
+                let scaled_delta = self.scaled_delta.as_mut().map(|tracker| {
+                    tracker.update(src, stride_bytes, pb_width, pb_height)
+                });
+                let rects: Vec<(u16, u16, u16, u16)> = match scaled_delta {
+                    Some(crate::frame_delta::Delta::Full) => {
+                        self.delta_full += 1;
+                        vec![(0, 0, pb_width, pb_height)]
+                    }
+                    Some(crate::frame_delta::Delta::Unchanged) => {
+                        self.delta_unchanged += 1;
+                        Vec::new()
+                    }
+                    Some(crate::frame_delta::Delta::Partial(rects)) => rects,
+                    None => {
+                        // Native capture: SCK's damage is already in output
+                        // coordinates. Preserve its original rect policy.
+                        let dirty = if !self.seeded || self.force_full_frame {
+                            None
+                        } else {
+                            sample.dirty_rects()
+                        };
+                        match dirty {
+                            Some(list) if !list.is_empty() => list
+                                .into_iter()
+                                .filter_map(|r| {
+                                    let origin = r.origin();
+                                    let size = r.size();
+                                    let x = origin.x.max(0.0).round() as u32;
+                                    let y = origin.y.max(0.0).round() as u32;
+                                    let w = size.width.max(0.0).round() as u32;
+                                    let h = size.height.max(0.0).round() as u32;
+                                    let x = u16::try_from(x.min(u32::from(pb_width))).ok()?;
+                                    let y = u16::try_from(y.min(u32::from(pb_height))).ok()?;
+                                    let w = u16::try_from(
+                                        w.min(u32::from(pb_width.saturating_sub(x))),
+                                    )
+                                    .ok()?;
+                                    let h = u16::try_from(
+                                        h.min(u32::from(pb_height.saturating_sub(y))),
+                                    )
+                                    .ok()?;
+                                    if w == 0 || h == 0 {
+                                        None
+                                    } else {
+                                        Some((x, y, w, h))
+                                    }
+                                })
+                                .collect(),
+                            _ => vec![(0, 0, pb_width, pb_height)],
+                        }
+                    }
                 };
 
-                let rects: Vec<(u16, u16, u16, u16)> = match dirty {
-                    Some(list) if !list.is_empty() => list
-                        .into_iter()
-                        .filter_map(|r| {
-                            let origin = r.origin();
-                            let size = r.size();
-                            let x = origin.x.max(0.0).round() as u32;
-                            let y = origin.y.max(0.0).round() as u32;
-                            let w = size.width.max(0.0).round() as u32;
-                            let h = size.height.max(0.0).round() as u32;
-                            let x = u16::try_from(x.min(u32::from(pb_width))).ok()?;
-                            let y = u16::try_from(y.min(u32::from(pb_height))).ok()?;
-                            let w =
-                                u16::try_from(w.min(u32::from(pb_width.saturating_sub(x)))).ok()?;
-                            let h = u16::try_from(h.min(u32::from(pb_height.saturating_sub(y))))
-                                .ok()?;
-                            if w == 0 || h == 0 {
-                                None
-                            } else {
-                                Some((x, y, w, h))
-                            }
-                        })
-                        .collect(),
-                    _ => vec![(0, 0, pb_width, pb_height)],
-                };
+                if self.scaled_delta.is_some() {
+                    self.delta_frames += 1;
+                    self.delta_rects += rects.len() as u64;
+                    if self.delta_last_log.elapsed() >= Duration::from_secs(5) {
+                        tracing::info!(
+                            frames = self.delta_frames,
+                            full = self.delta_full,
+                            unchanged = self.delta_unchanged,
+                            rects = self.delta_rects,
+                            "legacy scaled-frame delta statistics"
+                        );
+                        self.delta_last_log = Instant::now();
+                        self.delta_frames = 0;
+                        self.delta_full = 0;
+                        self.delta_unchanged = 0;
+                        self.delta_rects = 0;
+                    }
+                }
 
                 // Split oversized rects into strips so each BitmapUpdate stays
                 // within the size mstsc will render (see split_strips). No-op
