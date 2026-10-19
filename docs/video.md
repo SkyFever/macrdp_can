@@ -6,21 +6,50 @@ reconnect quirk and its fixes, and the color-conversion implementation notes.
 
 ## Display resolution (`--hidpi`)
 
-By default macrdp captures and advertises the Mac's **logical** resolution — the points it reports in System Settings (e.g. 1512×982 on a default-scaled 14" MacBook). On a Retina panel that's half the physical pixels, so any client whose window is larger upscales it and text looks soft.
+There are **two independent topologies**, implemented with a common aspect-fit
+capture pipeline:
 
-Pass **`--hidpi`** to prefer the display's **backing (Retina) pixel resolution** (e.g. 3024×1964) as the upper bound. **The RDP desktop is negotiated at the smaller of the client's requested dimensions and the backing dimensions** before Demand Active; a client advertising 1080×1196 is never sent a 3024×1964 legacy bitmap surface. This matters particularly for Android clients that advertise `AVC_DISABLED`. To force the fixed full backing size despite a smaller client, explicitly pass `--no-client-resolution` (not recommended on Android). HiDPI is **opt-in** because compatible large clients can generate ~4× the pixel work:
+1. **Mirroring the current physical display** (`--virtual-display` absent):
+   `--hidpi` **off** continues to honor the client-requested RDP desktop. With
+   `--hidpi` **on**, the physical panel's backing (Retina) pixel resolution
+   becomes the native-detail target and automatic session ceiling. Capture fits
+   the original Mac picture inside the agreed RDP canvas: black bars appear if
+   the client's aspect ratio leaves free space, otherwise the native picture
+   is scaled down as needed. No aspect stretching unless `--stretch` is chosen.
+   Both settings use exactly the same ScreenCaptureKit scaling, output-pixel
+   damage tracking, batching and mouse-coordinate mapping.
+2. **Capturing a virtual display** (`--virtual-display`): independent of
+   `--hidpi`. The virtual display is re-moded to the agreed client desktop
+   size, with a 1:1 capture and no physical-panel Retina calculations. Current
+   `CGVirtualDisplay` does not provide a reliably working logical-points vs
+   backing-pixels Retina mode (see [known quirks](known-quirks.md)).
 
-- **Pair it with `--enable-h264` on a client that actually negotiates AVC420.** VideoToolbox encodes large native-resolution frames much more efficiently than legacy bitmaps. If the client advertises `AVC_DISABLED`, the server falls back to BitmapUpdate, and a smaller negotiated desktop is safer than 4× the pixel work.
-- **Large HiDPI frames still cost more.** When the client requests native backing dimensions, it must decode/render those pixels. Legacy bitmap clients, including Android Windows App sessions that advertise `AVC_DISABLED`, may lag even on a fast LAN. The previous forced-full-size behavior is available with `--no-client-resolution`, but can exceed the surface the client announced and cause broken/stale rendering.
-- Ignored when you pass explicit `--width`/`--height` (you've pinned the session size) or with `--virtual-display` (which independently adopts client size). The controller's `HIDPI=1` follows the same negotiation rules.
+**An RDP server may not send a larger bitmap than the client negotiated.** A
+physical Mac framebuffer of `3360×2100` and Android request of `1080×1196`
+therefore produce a `1080×1196` RDP desktop, not a forced `3360×2100` one. The
+picture fits at `1080×675` with black bars at top/bottom. Only clients that
+**request enough resolution** can receive a native-resolution pixel stream;
+`--hidpi` cannot silently turn a small Android RDP canvas into a 2× canvas.
+The Retina backing ceiling is applied consistently during Demand Active,
+Confirm Active and live RDPEDISP resizes. Full-screen high-resolution legacy
+BitmapUpdates remain substantially more expensive than reduced-size captures.
 
-Input and cursor are resolution-correct at any setting — clicks land precisely and the pointer stays normal-sized.
+Explicit `--width`/`--height` on the mirror path pins the resolution (stretch
+behavior as before). `--no-client-resolution` also fixes the initial server
+resolution but can exceed the client surface and **corrupt** legacy bitmap
+rendering. Never use it to force physical Retina output on a small Android
+client. The controller's `HIDPI=1` maps to the same policy. For detailed
+examples and verification steps see
+[MIRROR_HIDPI_POLICY.md](MIRROR_HIDPI_POLICY.md).
 
-### Aspect ratio (auto-size path)
+### Aspect ratio (physical mirror with client auto-size)
 
-By default macrdp serves exactly the resolution the connecting client requests (e.g. mstsc full-screen on a 1920×1080 monitor gets a 1920×1080 session). When that resolution's aspect ratio differs from the Mac's panel (e.g. a 16:9 client against a 16:10 MacBook), macrdp **preserves the Mac's aspect ratio and adds black bars** (letterbox top/bottom or pillarbox left/right) so the picture isn't distorted, and maps mouse input into the centered picture so clicks stay accurate. Verified: a 1512×982 Mac served to a 1920×1080 client produces a centered 1663×1080 image with 128 px bars each side.
-
-Pass **`--stretch`** to instead fill the whole frame (the old behavior) — no bars, but the image is non-uniformly scaled on an aspect mismatch (e.g. ~13.5% vertical compression for 16:10→16:9). `--stretch` has no effect when the aspect already matches, or with explicit `--width`/`--height` (those always stretch). Either way, serving a non-native resolution forces full-frame updates (higher bandwidth) and, on **mstsc with `--enable-h264`**, the scaling amplifies its trailing-frame presentation lag — a Mac whose native resolution already matches the client (no scaling) is snappier. See "Video".
+The existing physical mirror captures into the *negotiated* RDP canvas while
+preserving the original Mac aspect ratio. Portrait clients get top/bottom bars;
+wide clients get left/right bars. The inverse mouse transform uses the same
+aspect-fit rectangle, so touches on black bars clamp to the nearby Mac edge.
+`--stretch` preserves the old fill-and-distort behavior instead. Virtual
+sessions don't letterbox; they change their actual virtual-monitor mode.
 
 ## Video (H.264)
 

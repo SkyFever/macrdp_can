@@ -19,7 +19,7 @@ Useful CLI flags (see `src/main.rs::Args` for the full set):
 --password PASS           # avoid the interactive prompt (logs are warned)
 --skip-auth               # bypass PAM (also skips password validation)
 --width  / --height       # override autodetected display size
---hidpi                   # prefer backing (Retina) pixels as the maximum
+--hidpi                   # physical-mirror only: backing-pixel ceiling; aspect-fit into client's negotiated canvas
                           #   negotiated session size on mirror-primary; smaller
                           #   clients get their requested RDP size instead.
                           #   Use --no-client-resolution to force full backing

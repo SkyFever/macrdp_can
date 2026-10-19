@@ -20,6 +20,7 @@ use std::sync::atomic::AtomicU64;
 use std::time::{Duration, Instant};
 
 use crate::cursor::CursorState;
+use crate::display_geometry::{self, DisplayPolicy};
 
 /// Tuning for the H.264 on-demand-keyframe feature (`--keyframe-on-change`).
 /// Built from CLI flags in `main.rs`; all percentages are of the full frame.
@@ -326,6 +327,9 @@ pub struct CaptureDisplay {
     /// `desktop_size` so capture, input scaling, and the H.264 pipeline
     /// all serve it.
     pub auto_size: bool,
+    /// Explicit resolution policy: physical-mirror logical, physical-mirror
+    /// Retina, or virtual-display. Only the first two can add letterboxing.
+    pub display_policy: DisplayPolicy,
     /// Opt out of aspect-preserving letterbox on the auto-size path: stretch the
     /// Mac screen to fill the client frame (the old default) instead of adding
     /// black bars. Only relevant when `auto_size` is scaling to a non-native
@@ -397,9 +401,10 @@ pub struct CaptureDisplay {
     /// path (both codec paths) and, via `virtual_display` below, on the
     /// virtual-display path.
     pub pending_resize: PendingResize,
-    /// Operator ceiling for a live client-requested resize (`--max-client-size`),
-    /// mirroring the connect-time cap the vendored acceptor applies. `None` =
-    /// no cap beyond the protocol max (still enforced by `adopt_client_size`).
+    /// Effective client-size ceiling (explicit `--max-client-size` OR physical
+    /// Retina backing-pixel limit), shared with the acceptor's connect-time
+    /// Demand Active negotiation. Applies to Confirm Active echoes and live
+    /// RDPEDISP resizes as well. `None` means only the protocol-size limit.
     pub max_client_size: Option<DesktopSize>,
     /// Set by the capture loop just before it emits a server-driven
     /// `DisplayUpdate::Resize` (blank recovery's same-size reactivate, or a
@@ -456,7 +461,15 @@ pub async fn primary_display_size() -> Result<Option<(u16, u16)>> {
             anyhow!("AsyncSCShareableContent::get failed (Screen Recording permission?): {e:?}")
         })?;
         let displays = content.displays();
-        let display = displays.first().context("no displays available")?;
+        // SCK's first item isn't guaranteed to match CGDisplay::main(). We
+        // must measure the same physical panel that provides the Retina
+        // backing size and input coordinates for mirror-primary sessions.
+        let primary_id = core_graphics::display::CGDisplay::main().id;
+        let display = displays
+            .iter()
+            .find(|d| d.display_id() == primary_id)
+            .or_else(|| displays.first())
+            .context("no displays available")?;
         let w = u16::try_from(display.width()).context("display width > u16")?;
         let h = u16::try_from(display.height()).context("display height > u16")?;
         Ok(Some((w, h)))
@@ -479,6 +492,20 @@ pub async fn primary_display_size() -> Result<Option<(u16, u16)>> {
 /// range (MS-RDPBCGR); an echo outside it is garbage we refuse to adopt, and a
 /// no-op echo (already current) needs no change.
 ///
+/// Cap a Confirm Active echo or a live resize by the same maximum negotiated
+/// in Demand Active. Never let one part of a session grow the bitmap surface
+/// beyond another part's size limit.
+fn clamp_client_size(client: DesktopSize, ceiling: Option<DesktopSize>) -> DesktopSize {
+    if let Some(max) = ceiling {
+        DesktopSize {
+            width: client.width.min(max.width),
+            height: client.height.min(max.height),
+        }
+    } else {
+        client
+    }
+}
+
 /// Returns `Some(adopted)` to switch, or `None` to keep the current size.
 fn adopt_client_size(
     auto_size: bool,
@@ -531,7 +558,8 @@ impl RdpServerDisplay for CaptureDisplay {
             return DesktopSize { width, height };
         }
 
-        if let Some(adopted) = adopt_client_size(self.auto_size, (width, height), client_size) {
+        let capped = clamp_client_size(client_size, self.max_client_size);
+        if let Some(adopted) = adopt_client_size(self.auto_size, (width, height), capped) {
             tracing::info!(
                 client_w = adopted.width,
                 client_h = adopted.height,
@@ -600,10 +628,9 @@ impl RdpServerDisplay for CaptureDisplay {
             return;
         };
 
-        if let Some(max) = self.max_client_size {
-            width = width.min(max.width);
-            height = height.min(max.height);
-        }
+        let capped = clamp_client_size(DesktopSize { width, height }, self.max_client_size);
+        width = capped.width;
+        height = capped.height;
 
         let (cur_w, cur_h) = self.desktop_size.get();
         let Some(adopted) =
@@ -833,6 +860,7 @@ impl CaptureDisplay {
                 self.display_suppressed.clone(),
                 self.auto_size,
                 self.stretch,
+                self.display_policy,
                 self.scaled_delta_enabled,
                 self.scaled_delta_batching,
                 self.desktop_size.clone(),
@@ -864,29 +892,22 @@ impl CaptureDisplay {
 /// unit-tested on every target; `mod macos` reaches it via `use super::*`.
 const MAX_BITMAP_UPDATE_PIXELS: u32 = 1280 * 720;
 
-/// Decide the capture scaling mode from the configured session size vs the
-/// display's `native` (points) and `backing` (HiDPI pixels) sizes. Pure (no
-/// platform deps) so it's unit-tested on every target; complements the input
-/// side ([`crate::input`]'s `map_client_to_display`, which consumes the
-/// resulting letterbox flag). Returns `(force_full_frame, letterbox)`:
-///
-/// - `force_full_frame`: SCK is scaling — the configured size matches neither
-///   native points NOR backing pixels — so its dirty-rects arrive in source
-///   coords and misalign; we must send whole frames. A 1:1 native OR backing
-///   capture (the `--hidpi` path) keeps dirty-rects valid, so it's `false`.
-/// - `letterbox`: preserve the Mac's aspect ratio with black bars instead of
-///   stretching to fill — only when scaling on the auto-size path and `--stretch`
-///   is not set. No scaling ⇒ nothing to letterbox.
+/// Capture and letterbox choice for the already-negotiated RDP surface.
+/// Retains the established dirty-rectangle exemption for logical/backing
+/// 1:1 captures while making the mirror/virtual distinction explicit. The
+/// aspect-fit maths are shared with `input.rs` via `display_geometry`.
 fn capture_scaling_mode(
     native: (u16, u16),
     backing: (u16, u16),
     configured: (u16, u16),
     auto_size: bool,
     stretch: bool,
+    policy: DisplayPolicy,
 ) -> (bool, bool) {
-    let force_full_frame = !(native == configured || backing == configured);
-    let letterbox = force_full_frame && auto_size && !stretch;
-    (force_full_frame, letterbox)
+    let plan = display_geometry::capture_plan(
+        policy, native, backing, configured, auto_size, stretch,
+    );
+    (plan.full_frame_damage, plan.letterbox)
 }
 
 /// Split a rect into horizontal strips each ≤ [`MAX_BITMAP_UPDATE_PIXELS`].
@@ -1072,6 +1093,7 @@ mod macos {
             display_suppressed: Option<Arc<AtomicBool>>,
             auto_size: bool,
             stretch: bool,
+            display_policy: DisplayPolicy,
             scaled_delta_enabled: bool,
             scaled_delta_batching: bool,
             desktop_size: SharedDesktopSize,
@@ -1137,8 +1159,22 @@ mod macos {
                 (width, height),
                 auto_size,
                 stretch,
+                display_policy,
             );
             desktop_size.set_letterbox(letterbox);
+            let detail_size = display_policy.source_dimensions(
+                (native_w, native_h),
+                (backing_w, backing_h),
+            );
+            tracing::info!(
+                mode = ?display_policy,
+                rdp_width = width,
+                rdp_height = height,
+                source_width = detail_size.0,
+                source_height = detail_size.1,
+                aspect_mode = if letterbox { "aspect-fit" } else { "fill" },
+                "RDP display capture policy"
+            );
             if force_full_frame {
                 tracing::warn!(
                     requested_w = width,
@@ -1877,6 +1913,16 @@ mod tests {
     use super::*;
 
     #[test]
+    fn retina_ceiling_applies_to_echoes_and_live_resize_requests() {
+        let android = DesktopSize { width: 1080, height: 1196 };
+        let retina = DesktopSize { width: 3360, height: 2100 };
+        assert_eq!(clamp_client_size(android, Some(retina)), android);
+        let huge = DesktopSize { width: 5000, height: 4000 };
+        assert_eq!(clamp_client_size(huge, Some(retina)), retina);
+        assert_eq!(clamp_client_size(huge, None), huge);
+    }
+
+    #[test]
     fn shared_desktop_size_roundtrips() {
         let size = SharedDesktopSize::new(1512, 982);
         assert_eq!(size.get(), (1512, 982));
@@ -2043,13 +2089,27 @@ mod tests {
         let backing = (3024, 1964); // Retina backing pixels
                                     // Configured == native points: 1:1, no full frame, no letterbox.
         assert_eq!(
-            capture_scaling_mode(native, backing, (1512, 982), true, false),
+            capture_scaling_mode(
+                native,
+                backing,
+                (1512, 982),
+                true,
+                false,
+                DisplayPolicy::MirrorLogical,
+            ),
             (false, false)
         );
         // Configured == backing pixels (--hidpi): also 1:1, no full frame, no
         // letterbox — the HiDPI exemption that must NOT force full frames.
         assert_eq!(
-            capture_scaling_mode(native, backing, (3024, 1964), true, false),
+            capture_scaling_mode(
+                native,
+                backing,
+                (3024, 1964),
+                true,
+                false,
+                DisplayPolicy::MirrorLogical,
+            ),
             (false, false)
         );
     }
@@ -2060,18 +2120,39 @@ mod tests {
         let backing = (3024, 1964);
         // Auto-size to a non-native size (scaling), no --stretch → letterbox.
         assert_eq!(
-            capture_scaling_mode(native, backing, (1920, 1080), true, false),
+            capture_scaling_mode(
+                native,
+                backing,
+                (1920, 1080),
+                true,
+                false,
+                DisplayPolicy::MirrorLogical,
+            ),
             (true, true)
         );
         // --stretch opts back into fill: full frames, but no letterbox.
         assert_eq!(
-            capture_scaling_mode(native, backing, (1920, 1080), true, true),
+            capture_scaling_mode(
+                native,
+                backing,
+                (1920, 1080),
+                true,
+                true,
+                DisplayPolicy::MirrorLogical,
+            ),
             (true, false)
         );
         // Explicit --width/--height (auto_size = false): full frames (SCK scales)
         // but the picture fills (stretch), so no letterbox.
         assert_eq!(
-            capture_scaling_mode(native, backing, (1920, 1080), false, false),
+            capture_scaling_mode(
+                native,
+                backing,
+                (1920, 1080),
+                false,
+                false,
+                DisplayPolicy::MirrorLogical,
+            ),
             (true, false)
         );
     }

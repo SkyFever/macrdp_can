@@ -118,17 +118,12 @@ fn map_client_to_display(
     let dwf = f64::from(dw.max(1));
     let dhf = f64::from(dh.max(1));
     let (mx, my) = if letterbox {
-        let mac_aspect = sw / sh.max(1.0);
-        let out_aspect = dwf / dhf;
-        let (cw, ch) = if out_aspect > mac_aspect {
-            (dhf * mac_aspect, dhf) // pillarbox: bars left/right
-        } else {
-            (dwf, dwf / mac_aspect) // letterbox: bars top/bottom
-        };
-        let off_x = (dwf - cw) / 2.0;
-        let off_y = (dhf - ch) / 2.0;
-        let fx = ((f64::from(x) - off_x) / cw).clamp(0.0, 1.0);
-        let fy = ((f64::from(y) - off_y) / ch).clamp(0.0, 1.0);
+        // Use the exact same aspect-fit rectangle used by the capture mode
+        // policy. Keeping the transform in one place prevents cursor/click
+        // drift when a portrait RDP client displays a Retina landscape Mac.
+        let content = crate::display_geometry::aspect_fit((sw, sh), (dwf, dhf));
+        let fx = ((f64::from(x) - content.x) / content.width).clamp(0.0, 1.0);
+        let fy = ((f64::from(y) - content.y) / content.height).clamp(0.0, 1.0);
         (fx * sw, fy * sh)
     } else {
         (f64::from(x) * sw / dwf, f64::from(y) * sh / dhf)

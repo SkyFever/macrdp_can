@@ -16,6 +16,7 @@ mod auth_guard;
 mod avc444;
 mod camera;
 mod capture;
+mod display_geometry;
 mod frame_delta;
 mod clipboard;
 mod clipboard_rich;
@@ -80,6 +81,7 @@ use x509_cert::Certificate;
 use zeroize::Zeroizing;
 
 use crate::capture::{primary_display_size, CaptureDisplay};
+use crate::display_geometry::DisplayPolicy;
 use crate::input::{ensure_accessibility_access, MacInputHandler};
 
 const FALLBACK_WIDTH: u16 = 1280;
@@ -198,12 +200,15 @@ struct Args {
     #[arg(long)]
     height: Option<u16>,
 
-    /// Prefer the primary display's backing (Retina) pixel resolution as the
-    /// session's upper bound rather than its logical points. When the client
-    /// requests a smaller desktop (e.g. Android Windows App), negotiate that
-    /// size BEFORE Demand Active so we never paint outside its bitmap surface.
-    /// --no-client-resolution explicitly opts into a fixed backing-size
-    /// desktop. Ignored with --width/--height or --virtual-display. macOS-only.
+    /// Physical-display mirror only: allow up to the panel's native Retina
+    /// backing pixels instead of its logical points. The mirrored image uses
+    /// the existing aspect-fit / black-bar scaling path. When the client
+    /// requests less than the native pixel size, fit/downsample into the
+    /// negotiated RDP surface; NEVER send larger legacy bitmaps than that
+    /// surface. To receive actual native pixels, the client must request a
+    /// sufficiently large RDP desktop. --no-client-resolution explicitly
+    /// opts into a fixed and potentially client-incompatible framebuffer.
+    /// Ignored with --virtual-display or explicit mirror --width/--height.
     #[arg(long)]
     hidpi: bool,
 
@@ -2220,20 +2225,28 @@ fn boost_thread_qos() {
     }
 }
 
-/// A mirror session must negotiate the dimensions the client can present.
-/// `--hidpi` chooses the backing-pixel ceiling, not an oversized fixed RDP
-/// desktop: Android Windows App can advertise 1080x1196 while the Mac panel is
-/// 3360x2100, and legacy BitmapUpdates beyond the negotiated client surface
-/// can render as repeated rows or a frozen picture. `--no-client-resolution`
-/// remains the explicit fixed-size opt-out.
+/// Select a resolution policy *before* negotiating the RDP desktop.
+/// A virtual display follows the client's size regardless of the HiDPI switch.
+/// Physical mirroring uses the same capture/letterbox path in both modes; the
+/// HiDPI switch only changes the backing-pixel ceiling of what we may send.
 fn auto_adopt_client_resolution(args: &Args) -> bool {
-    !args.no_client_resolution
-        && (args.virtual_display || (args.width.is_none() && args.height.is_none()))
+    if args.no_client_resolution {
+        return false;
+    }
+    match DisplayPolicy::from_flags(args.virtual_display, args.hidpi) {
+        DisplayPolicy::Virtual => true,
+        DisplayPolicy::MirrorLogical | DisplayPolicy::MirrorRetina => {
+            args.width.is_none() && args.height.is_none()
+        }
+    }
 }
 
 fn client_size_ceiling(args: &Args, auto_size: bool, backing: (u16, u16)) -> Option<(u16, u16)> {
+    if !auto_size {
+        return None;
+    }
     args.max_client_size.or_else(|| {
-        (auto_size && args.hidpi && !args.virtual_display).then_some(backing)
+        DisplayPolicy::from_flags(args.virtual_display, args.hidpi).implicit_ceiling(backing)
     })
 }
 
@@ -3080,7 +3093,12 @@ async fn async_main() -> Result<()> {
         key_der: udp_key_der,
     } = make_tls_acceptor(&cert_dir, args.cert.as_deref(), args.key.as_deref())?;
 
-    // Resolve desktop dimensions + geometry. Three paths:
+    // Resolve desktop dimensions + geometry. The virtual display and physical
+    // mirror have separate resolution policies even though they share the
+    // downstream ScreenCaptureKit / aspect-fit / BitmapUpdate pipeline.
+    let display_policy = DisplayPolicy::from_flags(args.virtual_display, args.hidpi);
+    info!(mode = ?display_policy, "display resolution policy selected");
+    // Three paths:
     //   - virtual display: width/height are already enforced as required
     //     above; geometry comes from the vdisplay's CGDisplayBounds.
     //   - primary panel, no --width/--height override: query SCK for
@@ -3128,7 +3146,7 @@ async fn async_main() -> Result<()> {
         // --height already pins the desktop. The actual SCK capture size is
         // set only after the client-resolution handshake.
         #[cfg(target_os = "macos")]
-        if args.hidpi && args.width.is_none() && args.height.is_none() {
+        if display_policy.is_mirror_retina() && args.width.is_none() && args.height.is_none() {
             if let Some((bw, bh)) = primary_backing_size() {
                 info!(
                     points_w = w,
@@ -3155,7 +3173,14 @@ async fn async_main() -> Result<()> {
             info!(width = w, height = h, "desktop size (no display detected)");
         }
         let (_origin, size) = primary_screen_geometry();
-        (w, h, None, size)
+        // Mirror the same CGMainDisplayID used for backing resolution and
+        // input coordinates. `SCKShareableContent.displays().first()` is not
+        // guaranteed to be the physical main display on multi-monitor Macs.
+        #[cfg(target_os = "macos")]
+        let main_display_id = Some(physical_main_id);
+        #[cfg(not(target_os = "macos"))]
+        let main_display_id = None;
+        (w, h, main_display_id, size)
     };
 
     // Frame rate: explicit --fps wins; otherwise 60 for H.264 (mstsc holds a
@@ -3172,11 +3197,13 @@ async fn async_main() -> Result<()> {
     // Adopt the client's requested resolution during RDP core negotiation,
     // BEFORE Demand Active, so bitmap updates fit the surface the client can
     // actually render. Virtual displays also re-mode to the client's size.
-    // In a mirror-primary session, explicit --width/--height pin the size;
-    // --hidpi alone now caps the adopted size at the panel's backing pixels
-    // rather than forcing the oversized backing desktop on small clients.
+    // In a physical mirror, explicit --width/--height pin the size;
+    // HiDPI uses the *same* negotiated-output scaling pipeline as HiDPI OFF,
+    // with the Retina backing as an optional upper bound. In a virtual session
+    // the display itself re-modes to match the client (HiDPI is ignored).
     // --no-client-resolution retains an explicitly fixed-size session.
     let auto_size = auto_adopt_client_resolution(&args);
+    let effective_client_ceiling = client_size_ceiling(&args, auto_size, (width, height));
     if auto_size {
         info!(
             "client-resolution auto-adopt enabled — the session will be served at \
@@ -3322,6 +3349,7 @@ async fn async_main() -> Result<()> {
         desktop_size: desktop_size.clone(),
         auto_size,
         stretch: args.stretch,
+        display_policy,
         scaled_delta_enabled: !args.no_scaled_delta,
         scaled_delta_batching: !args.no_scaled_delta_batching,
         fps,
@@ -3346,8 +3374,11 @@ async fn async_main() -> Result<()> {
         // MS-RDPEDISP monitor-layout PDU) — the counterpart to the
         // connect-time auto-adopt above. See `CaptureDisplay::request_layout`.
         pending_resize: capture::PendingResize::new(),
-        max_client_size: args
-            .max_client_size
+        // Use the SAME ceiling for Confirm Active echoes and live resizes as
+        // the acceptor uses during Demand Active. Previously this only held
+        // the explicit cap, letting a Retina session accidentally outgrow its
+        // negotiated backing-pixel ceiling on a later handshake/resize.
+        max_client_size: effective_client_ceiling
             .map(|(width, height)| ironrdp_server::DesktopSize { width, height }),
         suppress_next_adopt: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         // Shared so a live client resize can re-mode the display; None on
@@ -3525,8 +3556,7 @@ async fn async_main() -> Result<()> {
     // of this physical display). Explicit --max-client-size takes precedence.
     // Never negotiate a larger session just because the Mac has more pixels
     // than the Android/Windows client announced.
-    let requested_cap = client_size_ceiling(&args, auto_size, (width, height));
-    if let Some((max_w, max_h)) = requested_cap {
+    if let Some((max_w, max_h)) = effective_client_ceiling {
         if auto_size {
             server.set_honor_client_desktop_size_max(Some(ironrdp_server::DesktopSize {
                 width: max_w,
@@ -3535,7 +3565,11 @@ async fn async_main() -> Result<()> {
             info!(
                 max_w,
                 max_h,
-                source = if args.max_client_size.is_some() { "explicit" } else { "hidpi-backing" },
+                source = if args.max_client_size.is_some() {
+                    "explicit"
+                } else {
+                    "physical-retina-backing"
+                },
                 "client-requested session size capped"
             );
         } else {
