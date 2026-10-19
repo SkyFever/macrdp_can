@@ -161,6 +161,10 @@ pub struct BitmapUpdate {
     pub format: PixelFormat,
     pub data: Bytes,
     pub stride: NonZeroUsize,
+    /// Capture-side pixels were already compared to the last queued frame.
+    /// Encode this supplied rectangle as a unit instead of re-diffing and
+    /// splitting it into additional independent visible updates.
+    pub trusted_damage: bool,
 }
 
 impl BitmapUpdate {
@@ -194,6 +198,7 @@ impl BitmapUpdate {
     ///     format: PixelFormat::ARgb32,
     ///     data: Bytes::from(vec![0; 40000]),
     ///     stride: NonZeroUsize::new(400).unwrap(),
+    ///     trusted_damage: false,
     /// };
     ///
     /// let sub_region = original.sub(10, 10, NonZeroU16::new(50).unwrap(), NonZeroU16::new(50).unwrap());
@@ -215,6 +220,7 @@ impl BitmapUpdate {
                 format: self.format,
                 data: self.data.slice(start..end),
                 stride: self.stride,
+                trusted_damage: self.trusted_damage,
             })
         }
     }
@@ -229,6 +235,7 @@ impl core::fmt::Debug for BitmapUpdate {
             .field("height", &self.height)
             .field("format", &self.format)
             .field("stride", &self.stride)
+            .field("trusted_damage", &self.trusted_damage)
             .finish()
     }
 }
@@ -335,6 +342,7 @@ mod tests {
             format: fmt,
             data: data.into(),
             stride,
+            trusted_damage: false,
         };
         let diffs = vec![Rect::new(2, 3, 4, 5)];
         fb.update_diffs(&update, &diffs);

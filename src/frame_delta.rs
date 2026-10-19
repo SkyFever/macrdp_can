@@ -19,6 +19,99 @@ pub const MAX_DELTA_RECTS: usize = 96;
 
 pub type Rect = (u16, u16, u16, u16);
 
+/// Coalesce nearby output-space damage into fewer BitmapUpdates.
+///
+/// A legacy RDP client can present each BitmapUpdate separately, exposing
+/// seams between different moments of a moving desktop. A bounding rectangle
+/// covers all original damage, but can overdraw unchanged pixels. To avoid
+/// regressing the successful low-latency tile path, permit at most 2x the
+/// original dirty area for each group and never exceed the known-good maximum
+/// bitmap update size. More distant regions remain independent.
+///
+/// This reduces paint boundaries; it does NOT promise atomic RDP presentation.
+pub fn coalesce_bitmap_rects(rects: Vec<Rect>, max_pixels: u32) -> Vec<Rect> {
+    // The common moving-dock case has ~3-4 rects. Avoid a quadratic search on
+    // pathological checkerboards, which should be handled by the full fallback.
+    const MAX_INPUT_RECTS: usize = 32;
+    const MAX_OVERDRAW: u64 = 2;
+    if rects.len() < 2 || rects.len() > MAX_INPUT_RECTS || max_pixels == 0 {
+        return rects;
+    }
+
+    #[derive(Clone, Copy)]
+    struct Group {
+        rect: Rect,
+        /// Area of the original, disjoint tile rectangles in this group.
+        /// Tracking this across merges caps cumulative overdraw.
+        dirty_area: u64,
+    }
+
+    fn area(rect: Rect) -> u64 {
+        u64::from(rect.2) * u64::from(rect.3)
+    }
+
+    fn bounding(a: Rect, b: Rect) -> Option<Rect> {
+        let left = u32::from(a.0.min(b.0));
+        let top = u32::from(a.1.min(b.1));
+        let right = (u32::from(a.0) + u32::from(a.2))
+            .max(u32::from(b.0) + u32::from(b.2));
+        let bottom = (u32::from(a.1) + u32::from(a.3))
+            .max(u32::from(b.1) + u32::from(b.3));
+        Some((
+            u16::try_from(left).ok()?,
+            u16::try_from(top).ok()?,
+            u16::try_from(right - left).ok()?,
+            u16::try_from(bottom - top).ok()?,
+        ))
+    }
+
+    let mut groups: Vec<Group> = rects
+        .into_iter()
+        .map(|rect| Group {
+            rect,
+            dirty_area: area(rect),
+        })
+        .collect();
+    loop {
+        // Merge the least-expensive eligible pair first; this is small and
+        // deterministic (bounded by 32 input rectangles). Prefer a pair with
+        // minimum extra encoded pixels, then minimum output area.
+        let mut best: Option<(u64, u64, usize, usize, Rect)> = None;
+        for i in 0..groups.len() {
+            for j in i + 1..groups.len() {
+                let Some(merged) = bounding(groups[i].rect, groups[j].rect) else {
+                    continue;
+                };
+                let merged_area = area(merged);
+                let dirty_area = groups[i].dirty_area + groups[j].dirty_area;
+                if merged_area > u64::from(max_pixels)
+                    || merged_area > dirty_area * MAX_OVERDRAW
+                {
+                    continue;
+                }
+                let old_area = area(groups[i].rect) + area(groups[j].rect);
+                let additional_pixels = merged_area.saturating_sub(old_area);
+                let candidate = (additional_pixels, merged_area, i, j, merged);
+                if best.is_none_or(|prev| candidate < prev) {
+                    best = Some(candidate);
+                }
+            }
+        }
+        let Some((_, _, i, j, merged)) = best else {
+            break;
+        };
+        let dirty_area = groups[i].dirty_area + groups[j].dirty_area;
+        groups[i] = Group {
+            rect: merged,
+            dirty_area,
+        };
+        groups.remove(j);
+    }
+    // Preserve top-to-bottom / left-to-right presentation order across groups.
+    groups.sort_by_key(|group| (group.rect.1, group.rect.0));
+    groups.into_iter().map(|group| group.rect).collect()
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum Delta {
     /// New dimensions, a new connection, or too much change to benefit from
@@ -249,6 +342,54 @@ mod tests {
             let delta = d.update(&f, stride, w as u16, h as u16);
             apply(&mut reconstructed, &f, stride, w, h, &delta);
             assert_eq!(reconstructed, f);
+        }
+    }
+
+
+    #[test]
+    fn batching_merges_nearby_tiles_but_not_distant_regions() {
+        let near = vec![(0, 128, 128, 64), (192, 128, 64, 64), (0, 192, 256, 64)];
+        assert_eq!(
+            coalesce_bitmap_rects(near, 1280 * 720),
+            vec![(0, 128, 256, 128)]
+        );
+        let far = vec![(0, 0, 64, 64), (1728, 960, 64, 64)];
+        assert_eq!(coalesce_bitmap_rects(far.clone(), 1280 * 720), far);
+    }
+
+    #[test]
+    fn batching_obeys_single_update_area_limit() {
+        let split = vec![(0, 0, 960, 512), (0, 512, 960, 512)];
+        assert_eq!(coalesce_bitmap_rects(split.clone(), 1280 * 720), split);
+        assert_eq!(
+            coalesce_bitmap_rects(split, 1024 * 1024),
+            vec![(0, 0, 960, 1024)]
+        );
+    }
+
+    #[test]
+    fn batching_preserves_exact_reconstruction_for_moving_damage() {
+        let (w, h, stride) = (384usize, 320usize, 384 * 4 + 12);
+        let mut f = filled(w, h, stride);
+        let mut result = f.clone();
+        let mut delta = FrameDelta::default();
+        assert_eq!(delta.update(&f, stride, w as u16, h as u16), Delta::Full);
+        for step in 0..24usize {
+            // Simulate displaced dock icons with non-aligned, sparse motion.
+            for dy in 0..20 {
+                let x = (step * 7 + dy * 3) % 320;
+                let y = 180 + ((step * 13 + dy * 9) % 120);
+                paint(&mut f, stride, x, y);
+            }
+            let original = delta.update(&f, stride, w as u16, h as u16);
+            let batched = match original {
+                Delta::Partial(rects) => {
+                    Delta::Partial(coalesce_bitmap_rects(rects, 1280 * 720))
+                }
+                other => other,
+            };
+            apply(&mut result, &f, stride, w, h, &batched);
+            assert_eq!(result, f, "frame {step}: batching must preserve every pixel");
         }
     }
 

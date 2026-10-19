@@ -52,9 +52,16 @@ When the client advertises `AVC_DISABLED` (observed with some Android Windows
 App versions), the server uses legacy BitmapUpdate even with `--enable-h264`.
 A scaled client resolution no longer forces whole-screen legacy updates on
 *every* change: output-pixel tile damage now limits updates to changed areas.
-To compare against the original path, pass `--no-scaled-delta`. Hardware
-H.264 selection is also logged for AVC-capable clients, with an optional
-`MACRDP_REQUIRE_HW_ENCODER=1` diagnostic. See
+The follow-up experimental **delta batching** groups nearby tiles into fewer
+legacy paint updates to reduce motion seams. Use `--no-scaled-delta-batching`
+to compare with the earlier tile-only implementation (without disabling the
+tile tracker). This can mitigate, but cannot guarantee elimination of, tearing
+on clients that present each RDP update separately. See
+[the batching notes](docs/PERF_PATCH_DELTA_BATCHING.md).
+
+To compare against the original full-frame path, pass `--no-scaled-delta`.
+Hardware H.264 selection is also logged for AVC-capable clients, with an
+optional `MACRDP_REQUIRE_HW_ENCODER=1` diagnostic. See
 [the performance-patch notes](docs/PERF_PATCH_SCALED_LEGACY.md) for usage,
 limitations, and 45 FPS A/B instructions.
 

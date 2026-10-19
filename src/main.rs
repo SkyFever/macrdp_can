@@ -222,6 +222,12 @@ struct Args {
     #[arg(long)]
     no_scaled_delta: bool,
 
+    /// Disable temporal batching of nearby changed tiles on scaled legacy
+    /// BitmapUpdate sessions. Restores the previous per-tile send and vendored
+    /// secondary diff behavior while keeping the exact-tile optimization.
+    #[arg(long)]
+    no_scaled_delta_batching: bool,
+
     /// Cursor size multiplier (default 1.0). At 1.0 the pointer is forwarded at
     /// its native macOS size, matching the cursor on the Mac's own screen with
     /// an exact hotspot. Some RDP clients draw the pointer at 1:1 device pixels
@@ -3296,6 +3302,7 @@ async fn async_main() -> Result<()> {
         auto_size,
         stretch: args.stretch,
         scaled_delta_enabled: !args.no_scaled_delta,
+        scaled_delta_batching: !args.no_scaled_delta_batching,
         fps,
         display_id: capture_display_id,
         screen_size_pts,
@@ -3802,6 +3809,16 @@ mod scaled_legacy_delta_flag_tests {
             super::Args::try_parse_from(["macrdp", "--no-scaled-delta"])
                 .unwrap()
                 .no_scaled_delta
+        );
+        assert!(
+            !super::Args::try_parse_from(["macrdp"])
+                .unwrap()
+                .no_scaled_delta_batching
+        );
+        assert!(
+            super::Args::try_parse_from(["macrdp", "--no-scaled-delta-batching"])
+                .unwrap()
+                .no_scaled_delta_batching
         );
     }
 }

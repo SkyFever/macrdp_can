@@ -333,6 +333,9 @@ pub struct CaptureDisplay {
     /// Enable pixel-exact tile damage for scaled legacy clients. Opt out with
     /// `--no-scaled-delta` to compare against the original full-frame path.
     pub scaled_delta_enabled: bool,
+    /// Group nearby scaled-tile changes and avoid a redundant second diff in
+    /// the vendored encoder. Disable with --no-scaled-delta-batching.
+    pub scaled_delta_batching: bool,
     pub fps: u32,
     /// `Some(CGDirectDisplayID)` captures that specific display (e.g. a
     /// `VirtualDisplay`); `None` captures the first SCK display, which
@@ -829,6 +832,7 @@ impl CaptureDisplay {
                 self.auto_size,
                 self.stretch,
                 self.scaled_delta_enabled,
+                self.scaled_delta_batching,
                 self.desktop_size.clone(),
                 self.pending_resize.clone(),
                 self.suppress_next_adopt.clone(),
@@ -933,12 +937,15 @@ mod macos {
         // every tiny change (e.g. Dock animation) as full-screen damage.
         force_full_frame: bool,
         scaled_delta: Option<crate::frame_delta::FrameDelta>,
+        delta_batching: bool,
         // Low-rate diagnostics for scaled legacy BitmapUpdates.
         delta_last_log: Instant,
         delta_frames: u64,
         delta_full: u64,
         delta_unchanged: u64,
         delta_rects: u64,
+        delta_input_rects: u64,
+        delta_batched_frames: u64,
         cursor: CursorState,
         /// Last time the cursor shape was polled (`None` = never → poll
         /// immediately so the client gets its initial pointer). Each poll is a
@@ -1064,6 +1071,7 @@ mod macos {
             auto_size: bool,
             stretch: bool,
             scaled_delta_enabled: bool,
+            scaled_delta_batching: bool,
             desktop_size: SharedDesktopSize,
             pending_resize: PendingResize,
             suppress_next_adopt: Arc<AtomicBool>,
@@ -1228,11 +1236,14 @@ mod macos {
                 force_full_frame,
                 scaled_delta: (force_full_frame && scaled_delta_enabled)
                     .then(crate::frame_delta::FrameDelta::default),
+                delta_batching: scaled_delta_batching,
                 delta_last_log: Instant::now(),
                 delta_frames: 0,
                 delta_full: 0,
                 delta_unchanged: 0,
                 delta_rects: 0,
+                delta_input_rects: 0,
+                delta_batched_frames: 0,
                 cursor,
                 last_cursor_poll: None,
                 gfx,
@@ -1265,6 +1276,7 @@ mod macos {
         y: u16,
         w: u16,
         h: u16,
+        trusted_damage: bool,
     ) -> Option<DisplayUpdate> {
         let (Some(width), Some(height)) = (NonZeroU16::new(w), NonZeroU16::new(h)) else {
             return None;
@@ -1284,6 +1296,7 @@ mod macos {
             format: PixelFormat::BgrA32,
             data: Bytes::from(data),
             stride,
+            trusted_damage,
         }))
     }
 
@@ -1728,15 +1741,34 @@ mod macos {
                     }
                 };
 
+                // Multiple legacy BitmapUpdates from one SCK frame may be
+                // painted separately by the client. Consolidate nearby tile
+                // regions so a moving icon is less likely to show pieces of
+                // several moments at once. Bound the extra pixels and PDU size.
+                // The encoder's second diff MUST be skipped for these already
+                // pixel-verified regions, or it would split them apart again.
+                let original_rects = rects.len();
+                let trusted_damage = self.scaled_delta.is_some() && self.delta_batching;
+                let rects = if trusted_damage {
+                    crate::frame_delta::coalesce_bitmap_rects(rects, MAX_BITMAP_UPDATE_PIXELS)
+                } else {
+                    rects
+                };
                 if self.scaled_delta.is_some() {
                     self.delta_frames += 1;
                     self.delta_rects += rects.len() as u64;
+                    self.delta_input_rects += original_rects as u64;
+                    if rects.len() < original_rects {
+                        self.delta_batched_frames += 1;
+                    }
                     if self.delta_last_log.elapsed() >= Duration::from_secs(5) {
                         tracing::info!(
                             frames = self.delta_frames,
                             full = self.delta_full,
                             unchanged = self.delta_unchanged,
                             rects = self.delta_rects,
+                            original_rects = self.delta_input_rects,
+                            batched_frames = self.delta_batched_frames,
                             "legacy scaled-frame delta statistics"
                         );
                         self.delta_last_log = Instant::now();
@@ -1744,6 +1776,8 @@ mod macos {
                         self.delta_full = 0;
                         self.delta_unchanged = 0;
                         self.delta_rects = 0;
+                        self.delta_input_rects = 0;
+                        self.delta_batched_frames = 0;
                     }
                 }
 
@@ -1752,7 +1786,9 @@ mod macos {
                 // for already-small rects.
                 for (x, y, w, h) in rects {
                     for (sx, sy, sw, sh) in split_strips(x, y, w, h) {
-                        if let Some(update) = rect_update(src, stride_bytes, sx, sy, sw, sh) {
+                        if let Some(update) =
+                            rect_update(src, stride_bytes, sx, sy, sw, sh, trusted_damage)
+                        {
                             self.pending.push_back(update);
                         }
                     }
@@ -1798,6 +1834,7 @@ mod stub {
                 format: PixelFormat::ARgb32,
                 data: Bytes::from(data),
                 stride,
+                trusted_damage: false,
             }));
             Ok(Self {
                 queue,
@@ -2053,6 +2090,7 @@ mod tests {
                 format: PixelFormat::ARgb32,
                 data: Bytes::from(vec![0u8; usize::from(w) * 4]),
                 stride: NonZeroUsize::new(usize::from(w) * 4).unwrap(),
+                trusted_damage: false,
             })
         };
 
