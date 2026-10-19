@@ -8,11 +8,11 @@ reconnect quirk and its fixes, and the color-conversion implementation notes.
 
 By default macrdp captures and advertises the Mac's **logical** resolution — the points it reports in System Settings (e.g. 1512×982 on a default-scaled 14" MacBook). On a Retina panel that's half the physical pixels, so any client whose window is larger upscales it and text looks soft.
 
-Pass **`--hidpi`** to capture at the display's **backing (Retina) pixel resolution** instead (e.g. 3024×1964) — clients then render crisp native pixels. It's **opt-in** because it's ~4× the pixels:
+Pass **`--hidpi`** to prefer the display's **backing (Retina) pixel resolution** (e.g. 3024×1964) as the upper bound. **The RDP desktop is negotiated at the smaller of the client's requested dimensions and the backing dimensions** before Demand Active; a client advertising 1080×1196 is never sent a 3024×1964 legacy bitmap surface. This matters particularly for Android clients that advertise `AVC_DISABLED`. To force the fixed full backing size despite a smaller client, explicitly pass `--no-client-resolution` (not recommended on Android). HiDPI is **opt-in** because compatible large clients can generate ~4× the pixel work:
 
-- **Pair it with `--enable-h264`.** H.264 compresses the higher resolution cleanly and the client downscales it sharply — that's the real "Retina remote desktop" experience. On the legacy bitmap path it just means 4× the bandwidth.
-- **mstsc feels laggy at HiDPI.** mstsc decodes 4× the pixels every frame and its ~2-frame presentation buffer now holds 4×-bigger frames, so responsiveness drops. **Thincast / FreeRDP stay snappy** — their H.264 decoders keep up. The server itself isn't the bottleneck (it encodes a 3024×1964 frame in ~10 ms, well inside the 60fps budget); the cost is client-side decode. Prefer a capable client if you want HiDPI.
-- Ignored when you pass explicit `--width`/`--height` (you've chosen the size) or with `--virtual-display` (already an explicit resolution).
+- **Pair it with `--enable-h264` on a client that actually negotiates AVC420.** VideoToolbox encodes large native-resolution frames much more efficiently than legacy bitmaps. If the client advertises `AVC_DISABLED`, the server falls back to BitmapUpdate, and a smaller negotiated desktop is safer than 4× the pixel work.
+- **Large HiDPI frames still cost more.** When the client requests native backing dimensions, it must decode/render those pixels. Legacy bitmap clients, including Android Windows App sessions that advertise `AVC_DISABLED`, may lag even on a fast LAN. The previous forced-full-size behavior is available with `--no-client-resolution`, but can exceed the surface the client announced and cause broken/stale rendering.
+- Ignored when you pass explicit `--width`/`--height` (you've pinned the session size) or with `--virtual-display` (which independently adopts client size). The controller's `HIDPI=1` follows the same negotiation rules.
 
 Input and cursor are resolution-correct at any setting — clicks land precisely and the pointer stays normal-sized.
 

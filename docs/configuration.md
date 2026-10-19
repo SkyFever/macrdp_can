@@ -17,16 +17,17 @@ packaging side, see [../packaging/README.md](../packaging/README.md).
                           is to spawn `caffeinate` so an idle Mac doesn't
                           drop the connection mid-session)
 --width / --height        Override autodetected display size
---hidpi                   Capture the primary display at backing (Retina) pixel
-                          resolution instead of logical points (e.g. 3024×1964
-                          vs 1512×982) for crisp native pixels. ~4× the pixels;
-                          best with --enable-h264. Ignored with --width/--height
-                          or --virtual-display. See [video.md](video.md). macOS-only.
+--hidpi                   Use the primary display's backing (Retina) pixels as
+                          the auto-adopt ceiling. Smaller clients get their own
+                          requested session size (Android legacy bitmap safety).
+                          Pair with --no-client-resolution to force the full
+                          backing size (unsafe for smaller clients). Ignored
+                          with --width/--height or --virtual-display. macOS-only.
 --no-client-resolution    Serve the Mac's native size instead of adopting the
                           resolution the client requests at connect. By default,
-                          when mirroring without --width/--height/--hidpi/
-                          --virtual-display, macrdp serves exactly what the client
-                          asks for (so mstsc presents 1:1, no client-side rescale).
+                          when mirroring without --width/--height (including
+                          --hidpi), macrdp serves the size the client asks for
+                          (so mstsc presents 1:1, no client-side rescale).
                           Pass this to serve native and let the client scale.
 --stretch                 On the auto-size path, stretch the Mac screen to fill
                           the client frame. By default, when the client's
@@ -44,8 +45,9 @@ packaging side, see [../packaging/README.md](../packaging/README.md).
                           the protocol maximum 8192x8192 — a ~256 MB framebuffer
                           per frame. Each dimension must be in [200, 8192]. No
                           effect with --no-client-resolution or an explicit
-                          --width/--height/--hidpi/--virtual-display (those pin
-                          the size). Config key: MAX_CLIENT_SIZE.
+                          --width/--height mirror size. --hidpi automatically
+                          caps auto-adopt at backing size unless overridden.
+                          Config key: MAX_CLIENT_SIZE.
 --unminimize-on-switch    On Cmd+Tab, un-minimize the target app's window (bring
                           it back from the Dock) instead of just activating the
                           app. Off by default (matches native macOS, which leaves

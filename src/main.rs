@@ -198,13 +198,12 @@ struct Args {
     #[arg(long)]
     height: Option<u16>,
 
-    /// Capture the primary display at its backing (Retina) pixel resolution
-    /// instead of logical points — e.g. 3024×1964 instead of 1512×982 — so
-    /// clients render crisp native pixels instead of upscaling a point-density
-    /// frame. Off by default: it's ~4× the pixels (heavier on legacy/slow
-    /// links), and the win is biggest with --enable-h264 (compresses cleanly,
-    /// the client downscales sharply). Ignored when --width/--height are set or
-    /// with --virtual-display (already an explicit resolution). macOS-only.
+    /// Prefer the primary display's backing (Retina) pixel resolution as the
+    /// session's upper bound rather than its logical points. When the client
+    /// requests a smaller desktop (e.g. Android Windows App), negotiate that
+    /// size BEFORE Demand Active so we never paint outside its bitmap surface.
+    /// --no-client-resolution explicitly opts into a fixed backing-size
+    /// desktop. Ignored with --width/--height or --virtual-display. macOS-only.
     #[arg(long)]
     hidpi: bool,
 
@@ -717,12 +716,14 @@ struct Args {
     /// at exactly that size, so the client presents the video 1:1 instead of
     /// rescaling it (client-side rescaling on mstsc costs typing latency and,
     /// with --enable-h264, contributes to audio drift). Applies when mirroring
-    /// the primary display without --width/--height/--hidpi, and on
+    /// the primary display without explicit --width/--height (including
+    /// --hidpi, which caps auto-adopt at backing size), and on
     /// --virtual-display (where the virtual display is re-moded to the
     /// client's size — --width/--height are its initial size, not a pin).
     /// Pass this to always serve the size resolved at startup (the Mac
     /// display's native size, or the --width/--height virtual display size)
-    /// and let the client scale.
+    /// and let the client scale. Beware that smaller clients may not render
+    /// oversized legacy BitmapUpdates correctly on the fixed-size path.
     #[arg(long = "no-client-resolution", action = clap::ArgAction::SetTrue)]
     no_client_resolution: bool,
 
@@ -742,9 +743,10 @@ struct Args {
     /// size. Without it, an authenticated client can request up to the
     /// protocol maximum 8192x8192 — a ~256 MB BGRA framebuffer per frame.
     /// Each dimension must be in the RDP band [200, 8192]. No effect with
-    /// --no-client-resolution, or with an explicit --width/--height/--hidpi
-    /// on the mirror-primary path (those pin the size; --virtual-display
-    /// adopts, so the cap applies there). Config: MAX_CLIENT_SIZE.
+    /// --no-client-resolution or with explicit --width/--height on the
+    /// mirror-primary path. --hidpi on the auto-adopt path implicitly caps
+    /// to the backing resolution unless this option overrides it.
+    /// Config: MAX_CLIENT_SIZE.
     #[arg(long = "max-client-size", value_name = "WxH", value_parser = parse_max_client_size)]
     max_client_size: Option<(u16, u16)>,
 
@@ -2218,6 +2220,23 @@ fn boost_thread_qos() {
     }
 }
 
+/// A mirror session must negotiate the dimensions the client can present.
+/// `--hidpi` chooses the backing-pixel ceiling, not an oversized fixed RDP
+/// desktop: Android Windows App can advertise 1080x1196 while the Mac panel is
+/// 3360x2100, and legacy BitmapUpdates beyond the negotiated client surface
+/// can render as repeated rows or a frozen picture. `--no-client-resolution`
+/// remains the explicit fixed-size opt-out.
+fn auto_adopt_client_resolution(args: &Args) -> bool {
+    !args.no_client_resolution
+        && (args.virtual_display || (args.width.is_none() && args.height.is_none()))
+}
+
+fn client_size_ceiling(args: &Args, auto_size: bool, backing: (u16, u16)) -> Option<(u16, u16)> {
+    args.max_client_size.or_else(|| {
+        (auto_size && args.hidpi && !args.virtual_display).then_some(backing)
+    })
+}
+
 fn main() -> Result<()> {
     // Build the tokio runtime explicitly so every worker thread starts
     // at boosted QoS (see `boost_thread_qos`). `#[tokio::main]`'s
@@ -3104,9 +3123,10 @@ async fn async_main() -> Result<()> {
             .height
             .or(detected.map(|(_, h)| h))
             .unwrap_or(FALLBACK_HEIGHT);
-        // --hidpi: capture at the display's backing (Retina) pixel resolution
-        // instead of logical points, unless the user pinned an explicit
-        // --width/--height (in which case they've chosen the size themselves).
+        // --hidpi: use the primary display's backing (Retina) pixels as the
+        // initial size / auto-adopt upper bound, unless explicit --width or
+        // --height already pins the desktop. The actual SCK capture size is
+        // set only after the client-resolution handshake.
         #[cfg(target_os = "macos")]
         if args.hidpi && args.width.is_none() && args.height.is_none() {
             if let Some((bw, bh)) = primary_backing_size() {
@@ -3115,7 +3135,7 @@ async fn async_main() -> Result<()> {
                     points_h = h,
                     backing_w = bw,
                     backing_h = bh,
-                    "--hidpi: capturing at backing pixel resolution"
+                    "--hidpi: backing pixel resolution is the session ceiling"
                 );
                 w = bw;
                 h = bh;
@@ -3149,32 +3169,33 @@ async fn async_main() -> Result<()> {
     // client's requested resolution at connect time.
     let desktop_size = capture::SharedDesktopSize::new(width, height);
 
-    // Adopt the client's requested resolution at connect (and re-mode to
-    // match on a live resize). Two cases:
-    //   - Virtual display: --width/--height are the display's INITIAL size,
-    //     not a pin — adopt the client's request and re-mode the virtual
-    //     display to match, so a phone and a laptop each get a crisp 1:1
-    //     desktop (and their mouse coords, sent in the client's own size,
-    //     map correctly). --hidpi is inert on this path.
-    //   - Mirror-primary: adopt only when nothing pins the size
-    //     (--width/--height pin a size, --hidpi pins backing pixels).
-    // --no-client-resolution opts out in both cases — the virtual display
-    // then stays fixed at --width/--height; mirror-primary serves native.
-    let auto_size = !args.no_client_resolution
-        && if args.virtual_display {
-            true
-        } else {
-            !args.hidpi && args.width.is_none() && args.height.is_none()
-        };
+    // Adopt the client's requested resolution during RDP core negotiation,
+    // BEFORE Demand Active, so bitmap updates fit the surface the client can
+    // actually render. Virtual displays also re-mode to the client's size.
+    // In a mirror-primary session, explicit --width/--height pin the size;
+    // --hidpi alone now caps the adopted size at the panel's backing pixels
+    // rather than forcing the oversized backing desktop on small clients.
+    // --no-client-resolution retains an explicitly fixed-size session.
+    let auto_size = auto_adopt_client_resolution(&args);
     if auto_size {
         info!(
             "client-resolution auto-adopt enabled — the session will be served at \
              the resolution the client requests{} (--no-client-resolution disables)",
             if args.virtual_display {
                 ", re-moding the virtual display to match"
+            } else if args.hidpi {
+                ", capped to the Mac's backing-pixel resolution"
             } else {
                 ""
             }
+        );
+    } else if args.hidpi && !args.virtual_display {
+        warn!(
+            width,
+            height,
+            "HiDPI fixed-size session: clients requesting smaller desktops may \
+             drop or corrupt oversized BitmapUpdates; remove --no-client-resolution \
+             or explicit --width/--height to negotiate the client size"
         );
     }
 
@@ -3499,11 +3520,13 @@ async fn async_main() -> Result<()> {
     // shared `desktop_size` that capture, input scaling, and the H.264
     // pipeline all read.
     server.set_honor_client_desktop_size(auto_size);
-    // Optional operator ceiling for the adopted size (--max-client-size,
-    // defense-in-depth): a request above the cap is clamped per-dimension in
-    // the acceptor. Meaningless off the auto-adopt path (nothing is adopted),
-    // so warn rather than silently ignore.
-    if let Some((max_w, max_h)) = args.max_client_size {
+    // Protect the client-sized surface at accept time. For --hidpi, backing
+    // pixels are a sensible implicit ceiling (the highest native-detail mode
+    // of this physical display). Explicit --max-client-size takes precedence.
+    // Never negotiate a larger session just because the Mac has more pixels
+    // than the Android/Windows client announced.
+    let requested_cap = client_size_ceiling(&args, auto_size, (width, height));
+    if let Some((max_w, max_h)) = requested_cap {
         if auto_size {
             server.set_honor_client_desktop_size_max(Some(ironrdp_server::DesktopSize {
                 width: max_w,
@@ -3511,12 +3534,14 @@ async fn async_main() -> Result<()> {
             }));
             info!(
                 max_w,
-                max_h, "client-requested session size capped at the operator maximum"
+                max_h,
+                source = if args.max_client_size.is_some() { "explicit" } else { "hidpi-backing" },
+                "client-requested session size capped"
             );
         } else {
             warn!(
                 "--max-client-size has no effect: client-resolution auto-adopt is off \
-                 (--no-client-resolution, or an explicit --width/--height/--hidpi \
+                 (--no-client-resolution or explicit --width/--height \
                  without --virtual-display)"
             );
         }
@@ -3796,6 +3821,60 @@ mod lock_on_disconnect_tests {
         let args = super::Args::try_parse_from(["macrdp", "--lock-on-disconnect"]);
         assert!(args.is_ok());
         assert!(args.unwrap().lock_on_disconnect);
+    }
+}
+
+#[cfg(test)]
+mod hidpi_client_resolution_tests {
+    use clap::Parser;
+
+    fn auto(extra: &[&str]) -> bool {
+        let args = super::Args::try_parse_from(
+            std::iter::once("macrdp").chain(extra.iter().copied()),
+        )
+        .expect("valid CLI arguments");
+        super::auto_adopt_client_resolution(&args)
+    }
+
+    #[test]
+    fn retina_mirror_auto_adopts_small_android_clients() {
+        assert!(auto(&[]));
+        assert!(auto(&["--hidpi"]));
+        assert!(auto(&["--hidpi", "--enable-h264"]));
+    }
+
+    #[test]
+    fn explicit_fixed_size_is_still_available() {
+        assert!(!auto(&["--no-client-resolution"]));
+        assert!(!auto(&["--hidpi", "--no-client-resolution"]));
+        assert!(!auto(&["--hidpi", "--width", "1920"]));
+        assert!(!auto(&["--height", "1080"]));
+    }
+
+    #[test]
+    fn virtual_display_ignores_fixed_initial_width() {
+        assert!(auto(&["--virtual-display", "--width", "1920", "--height", "1080"]));
+        assert!(auto(&["--virtual-display", "--hidpi"]));
+        assert!(!auto(&["--virtual-display", "--no-client-resolution"]));
+    }
+
+    #[test]
+    fn retina_auto_size_is_capped_at_backing_size() {
+        let backing = (3360, 2100);
+        let args = super::Args::try_parse_from(["macrdp", "--hidpi"]).unwrap();
+        assert_eq!(super::client_size_ceiling(&args, true, backing), Some(backing));
+
+        let args = super::Args::try_parse_from([
+            "macrdp", "--hidpi", "--max-client-size", "1920x1080",
+        ]).unwrap();
+        assert_eq!(super::client_size_ceiling(&args, true, backing), Some((1920, 1080)));
+
+        let args = super::Args::try_parse_from(["macrdp"]).unwrap();
+        assert_eq!(super::client_size_ceiling(&args, true, backing), None);
+        let args = super::Args::try_parse_from(["macrdp", "--virtual-display", "--hidpi"]).unwrap();
+        assert_eq!(super::client_size_ceiling(&args, true, backing), None);
+        let args = super::Args::try_parse_from(["macrdp", "--hidpi", "--no-client-resolution"]).unwrap();
+        assert_eq!(super::client_size_ceiling(&args, false, backing), None);
     }
 }
 

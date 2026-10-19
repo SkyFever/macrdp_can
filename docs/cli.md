@@ -19,14 +19,12 @@ Useful CLI flags (see `src/main.rs::Args` for the full set):
 --password PASS           # avoid the interactive prompt (logs are warned)
 --skip-auth               # bypass PAM (also skips password validation)
 --width  / --height       # override autodetected display size
---hidpi                   # capture the primary display at backing (Retina) pixels
-                          #   instead of logical points (~4x pixels; crisp; best
-                          #   with --enable-h264). Ignored with --width/--height
-                          #   or --virtual-display. macOS-only. Also disables live
-                          #   client-driven resize (a resized client window is
-                          #   silently ignored) — resize needs the client-resolution
-                          #   auto-adopt path, which --hidpi pins off, same as it
-                          #   pins the initial connect-time size.
+--hidpi                   # prefer backing (Retina) pixels as the maximum
+                          #   negotiated session size on mirror-primary; smaller
+                          #   clients get their requested RDP size instead.
+                          #   Use --no-client-resolution to force full backing
+                          #   size (unsafe when the client requests less).
+                          #   Ignored with --width/--height or --virtual-display.
 --fps N                   # default 60 with --enable-h264, else 15
 --cursor-scale MULT       # pointer size multiplier (default 1.0 = native macOS
                           #   size, hotspot-exact). Bump (e.g. 1.5/2.0) if your
@@ -64,8 +62,8 @@ MACRDP_MODS_RESYNC_IDLE_MS=10000  # env-only: after this many ms with no input,
 --no-client-resolution    # Don't adopt the resolution the client requests at
                           #   connect (the auto-adopt default). Auto-adopt
                           #   applies on the mirror-primary path when no
-                          #   --width/--height/--hidpi is given, AND on
-                          #   --virtual-display (the vd is re-moded to the
+                          #   --width/--height is absent (also with --hidpi),
+                          #   AND on --virtual-display (the vd is re-moded to the
                           #   client's size; --width/--height are its initial
                           #   size, not a pin). With this flag the session is
                           #   served at the startup-resolved size (native

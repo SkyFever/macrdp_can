@@ -312,8 +312,9 @@ pub struct CaptureDisplay {
     /// resolution means the client never rescales the decoded video —
     /// client-side rescaling on mstsc costs typing latency and, with
     /// `--enable-h264`, audio desync. Enabled by default on the
-    /// mirror-primary path when no explicit `--width`/`--height`/`--hidpi`
-    /// was given; `--no-client-resolution` opts out.
+    /// mirror-primary path without explicit `--width`/`--height`;
+    /// `--hidpi` still enables client-size adoption but caps the session
+    /// at the backing-pixel dimensions. `--no-client-resolution` opts out.
     ///
     /// The actual size negotiation happens in the vendored
     /// `ironrdp-acceptor` (`honor_client_desktop_size`, wired via
@@ -557,7 +558,8 @@ impl RdpServerDisplay for CaptureDisplay {
     /// the virtual-display path (`virtual_display` is `Some` — the display
     /// itself is re-moded to the requested size in `updates()`, so the
     /// session stays a 1:1 native capture at the new size). Still a no-op
-    /// for a pinned size (`--width`/`--height`/`--hidpi` without a vd).
+    /// for a pinned size (`--width`/`--height` without a vd, or
+    /// `--no-client-resolution`).
     /// Debounced by the capture loop via `pending_resize` so a window drag
     /// (many PDUs/sec) produces one resize, not one per tick. Both codec
     /// paths ride the same core deactivation-reactivation; on the EGFX
@@ -572,8 +574,8 @@ impl RdpServerDisplay for CaptureDisplay {
         if !resizable {
             tracing::debug!(
                 "client requested a live resize (window drag) but the session size \
-                 is pinned (--no-client-resolution, or an explicit \
-                 --width/--height/--hidpi without a virtual display) — ignoring"
+                 is pinned (--no-client-resolution or explicit \
+                 --width/--height without a virtual display) — ignoring"
             );
             return;
         }
