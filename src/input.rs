@@ -233,7 +233,10 @@ fn should_remap_click(remap_on: bool, ctrl: bool, cmd: bool, alt: bool, excluded
 
 #[cfg(test)]
 mod coord_tests {
-    use super::{is_remappable_shortcut, map_client_to_display, should_remap_click};
+    use super::{
+        is_remappable_shortcut, map_client_delta_to_display, map_client_to_display,
+        should_remap_click,
+    };
 
     /// The full mouse Ctrl→Cmd decision table. Exactly one row remaps: the
     /// flag is on, a plain Ctrl is held (no Cmd, no Alt), and the frontmost app
