@@ -151,6 +151,40 @@ fn map_client_to_display(
     )
 }
 
+/// Convert an RDP relative pointer delta (desktop pixel units) into the
+/// target macOS display's logical-point units. An absolute move already
+/// inverts the aspect-fit content rectangle above, but relative events also
+/// need that inverse scale: treating a 40 px client delta as 40 Mac points
+/// makes the real cursor drift from the client-predicted cursor when a Retina
+/// mirror is downscaled or letterboxed.
+///
+/// Offsets of the black bars do NOT apply to deltas; only the displayed
+/// content's width and height affect the scale. Keep this separate from the
+/// absolute mapping so relative gestures do not clamp until after they are
+/// added to the current global cursor position.
+fn map_client_delta_to_display(
+    dx: i32,
+    dy: i32,
+    dw: u16,
+    dh: u16,
+    sw: f64,
+    sh: f64,
+    letterbox: bool,
+) -> (f64, f64) {
+    let dwf = f64::from(dw.max(1));
+    let dhf = f64::from(dh.max(1));
+    let (cw, ch) = if letterbox {
+        let content = crate::display_geometry::aspect_fit((sw, sh), (dwf, dhf));
+        (content.width, content.height)
+    } else {
+        (dwf, dhf)
+    };
+    (
+        f64::from(dx) * sw / cw.max(1.0),
+        f64::from(dy) * sh / ch.max(1.0),
+    )
+}
+
 /// macOS virtual keycodes whose `Ctrl+<key>` combo is remapped to `Cmd+<key>`
 /// under --map-ctrl-to-cmd: C V X A Z S F N T W O P R G , (copy / paste / cut /
 /// select-all / undo / save / find / new / new-tab / close / open / print /
@@ -311,6 +345,48 @@ mod coord_tests {
         assert!(approx(my, 0.0));
         let (_, my) = map_client_to_display(960, 1080, 1920, 1080, sw, sh, true);
         assert!(approx(my, sh - 1.0));
+    }
+
+    #[test]
+    fn relative_retina_mirror_matches_absolute_aspect_fit_scale() {
+        // Mac logical 1680x1050 (backing 3360x2100), negotiated Android
+        // desktop 1968x2100. Aspect-fit content is 1968x1230 with 435px
+        // bars above and below, so 196.8 client px == 168 Mac points.
+        let (dx, dy) = map_client_delta_to_display(197, 123, 1968, 2100, 1680.0, 1050.0, true);
+        assert!(approx(dx, 197.0 * 1680.0 / 1968.0));
+        assert!(approx(dy, 123.0 * 1050.0 / 1230.0));
+
+        // The inverse relative scale must match the difference of two
+        // absolute mappings well inside the content (away from clamps).
+        let (ax0, ay0) = map_client_to_display(960, 1050, 1968, 2100, 1680.0, 1050.0, true);
+        let (ax1, ay1) = map_client_to_display(1157, 1173, 1968, 2100, 1680.0, 1050.0, true);
+        assert!(approx(ax1 - ax0, dx));
+        assert!(approx(ay1 - ay0, dy));
+    }
+
+    #[test]
+    fn relative_portrait_letterbox_and_stretch_use_correct_units() {
+        // 1080x1196 portrait client displaying 1680x1050 landscape Mac:
+        // fitted image is 1080x675 (top/bottom padding 260.5 px).
+        let (dx, dy) = map_client_delta_to_display(-108, 67, 1080, 1196, 1680.0, 1050.0, true);
+        assert!(approx(dx, -168.0));
+        assert!(approx(dy, 67.0 * 1050.0 / 675.0));
+        // When stretch is explicitly enabled, the *whole* desktop is the
+        // content rectangle, even if its aspect ratio does not match.
+        let (dx, dy) = map_client_delta_to_display(-108, 67, 1080, 1196, 1680.0, 1050.0, false);
+        assert!(approx(dx, -168.0));
+        assert!(approx(dy, 67.0 * 1050.0 / 1196.0));
+    }
+
+    #[test]
+    fn relative_one_to_one_virtual_and_scaled_mirror() {
+        assert_eq!(
+            map_client_delta_to_display(20, -15, 1920, 1080, 1920.0, 1080.0, false),
+            (20.0, -15.0),
+        );
+        let (dx, dy) = map_client_delta_to_display(200, -100, 3360, 2100, 1680.0, 1050.0, false);
+        assert!(approx(dx, 100.0));
+        assert!(approx(dy, -50.0));
     }
 
     #[test]
@@ -771,6 +847,9 @@ mod macos {
         // on the very event that drives the context menu. Latching also keeps
         // `frontmost_is_excluded()` off the per-motion drag path entirely.
         left_click_remapped: bool,
+        // First-use diagnostics for the RDP absolute and relative pointer paths.
+        // One log per mode, never one log per pointer movement.
+        pointer_modes_logged: u8,
         // Monotonic ms of the previous input event, for the idle-gap modifier
         // resync in `resync_modifiers_if_stale`. u64::MAX = no event yet.
         last_event_ms: u64,
@@ -862,6 +941,7 @@ mod macos {
                 consumed_keys: HashSet::new(),
                 remapped_keys: HashSet::new(),
                 left_click_remapped: false,
+                pointer_modes_logged: 0,
                 last_event_ms: u64::MAX,
                 reset_request: super::modifier_reset_handle(),
                 layout,
@@ -1543,7 +1623,9 @@ mod macos {
                 | MouseEvent::Button5Released => {
                     trace!(?event, "extra mouse buttons not implemented");
                 }
-                MouseEvent::RelMove { x, y } => self.move_rel(x, y),
+                MouseEvent::RelMove { x, y } => {
+                    self.move_rel(x, y, desktop_w, desktop_h, letterbox)
+                }
             }
         }
 
@@ -1554,6 +1636,18 @@ mod macos {
             // display (virtual or external) — the WindowServer dispatches by
             // which display contains the global coord.
             let (ox, oy, sw, sh) = self.target_bounds();
+            if self.pointer_modes_logged & 1 == 0 {
+                self.pointer_modes_logged |= 1;
+                tracing::info!(
+                    mode = "absolute",
+                    rdp_w = desktop_w,
+                    rdp_h = desktop_h,
+                    display_w_pts = sw,
+                    display_h_pts = sh,
+                    letterbox,
+                    "RDP mouse geometry"
+                );
+            }
             let (mx, my) =
                 super::map_client_to_display(x, y, desktop_w, desktop_h, sw, sh, letterbox);
             self.post_move(ox + mx, oy + my);
@@ -1572,10 +1666,37 @@ mod macos {
         /// dropped entirely (`trace!` no-op), which — on a client that relies
         /// on it for some or all pointer motion — left the cursor unable to
         /// reach the screen edge at all.
-        fn move_rel(&mut self, dx: i32, dy: i32) {
+        fn move_rel(
+            &mut self,
+            dx: i32,
+            dy: i32,
+            desktop_w: u16,
+            desktop_h: u16,
+            letterbox: bool,
+        ) {
             let (ox, oy, sw, sh) = self.target_bounds();
-            let sx = (self.last_x + f64::from(dx)).clamp(ox, ox + sw - 1.0);
-            let sy = (self.last_y + f64::from(dy)).clamp(oy, oy + sh - 1.0);
+            let (mx, my) = super::map_client_delta_to_display(
+                dx, dy, desktop_w, desktop_h, sw, sh, letterbox,
+            );
+            if self.pointer_modes_logged & 2 == 0 {
+                self.pointer_modes_logged |= 2;
+                let (scale_x, scale_y) = super::map_client_delta_to_display(
+                    1, 1, desktop_w, desktop_h, sw, sh, letterbox,
+                );
+                tracing::info!(
+                    mode = "relative",
+                    rdp_w = desktop_w,
+                    rdp_h = desktop_h,
+                    display_w_pts = sw,
+                    display_h_pts = sh,
+                    letterbox,
+                    scale_x,
+                    scale_y,
+                    "RDP mouse geometry"
+                );
+            }
+            let sx = (self.last_x + mx).clamp(ox, ox + sw - 1.0);
+            let sy = (self.last_y + my).clamp(oy, oy + sh - 1.0);
             self.post_move(sx, sy);
         }
 
