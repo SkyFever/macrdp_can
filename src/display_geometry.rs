@@ -90,17 +90,14 @@ pub fn capture_plan(
     let full_frame_damage = negotiated != logical && negotiated != backing;
     // A virtual display changes its own mode and is never letterboxed. When
     // mirroring, letterbox only if a client-sized output actually leaves bars.
-    let letterbox = !matches!(policy, DisplayPolicy::Virtual)
-        && auto_size
-        && !stretch
-        && {
-            let source = policy.source_dimensions(logical, backing);
-            let content = aspect_fit(
-                (f64::from(source.0), f64::from(source.1)),
-                (f64::from(negotiated.0), f64::from(negotiated.1)),
-            );
-            content.x > 0.5 || content.y > 0.5
-        };
+    let letterbox = !matches!(policy, DisplayPolicy::Virtual) && auto_size && !stretch && {
+        let source = policy.source_dimensions(logical, backing);
+        let content = aspect_fit(
+            (f64::from(source.0), f64::from(source.1)),
+            (f64::from(negotiated.0), f64::from(negotiated.1)),
+        );
+        content.x > 0.5 || content.y > 0.5
+    };
     CapturePlan {
         full_frame_damage,
         letterbox,
@@ -113,19 +110,43 @@ mod tests {
 
     #[test]
     fn real_and_virtual_retina_modes_are_separate() {
-        assert_eq!(DisplayPolicy::from_flags(false, false), DisplayPolicy::MirrorLogical);
-        assert_eq!(DisplayPolicy::from_flags(false, true), DisplayPolicy::MirrorRetina);
-        assert_eq!(DisplayPolicy::from_flags(true, false), DisplayPolicy::Virtual);
-        assert_eq!(DisplayPolicy::from_flags(true, true), DisplayPolicy::Virtual);
-        assert_eq!(DisplayPolicy::MirrorRetina.source_dimensions((1680, 1050), (3360, 2100)), (3360, 2100));
-        assert_eq!(DisplayPolicy::Virtual.source_dimensions((1680, 1050), (3360, 2100)), (1680, 1050));
+        assert_eq!(
+            DisplayPolicy::from_flags(false, false),
+            DisplayPolicy::MirrorLogical
+        );
+        assert_eq!(
+            DisplayPolicy::from_flags(false, true),
+            DisplayPolicy::MirrorRetina
+        );
+        assert_eq!(
+            DisplayPolicy::from_flags(true, false),
+            DisplayPolicy::Virtual
+        );
+        assert_eq!(
+            DisplayPolicy::from_flags(true, true),
+            DisplayPolicy::Virtual
+        );
+        assert_eq!(
+            DisplayPolicy::MirrorRetina.source_dimensions((1680, 1050), (3360, 2100)),
+            (3360, 2100)
+        );
+        assert_eq!(
+            DisplayPolicy::Virtual.source_dimensions((1680, 1050), (3360, 2100)),
+            (1680, 1050)
+        );
     }
 
     #[test]
     fn retina_mirror_letterboxes_portrait_android_request_without_oversize() {
         let mode = DisplayPolicy::MirrorRetina;
         let plan = capture_plan(mode, (1680, 1050), (3360, 2100), (1080, 1196), true, false);
-        assert_eq!(plan, CapturePlan { full_frame_damage: true, letterbox: true });
+        assert_eq!(
+            plan,
+            CapturePlan {
+                full_frame_damage: true,
+                letterbox: true
+            }
+        );
         let rect = aspect_fit((3360.0, 2100.0), (1080.0, 1196.0));
         assert_eq!(rect.width, 1080.0);
         assert!((rect.height - 675.0).abs() < 0.001);
@@ -153,7 +174,10 @@ mod tests {
                 true,
                 false,
             ),
-            CapturePlan { full_frame_damage: true, letterbox: true },
+            CapturePlan {
+                full_frame_damage: true,
+                letterbox: true
+            },
         );
     }
 
@@ -167,7 +191,13 @@ mod tests {
             true,
             false,
         );
-        assert_eq!(plan, CapturePlan { full_frame_damage: false, letterbox: false });
+        assert_eq!(
+            plan,
+            CapturePlan {
+                full_frame_damage: false,
+                letterbox: false
+            }
+        );
     }
 
     #[test]
@@ -175,16 +205,31 @@ mod tests {
         // The RDP output never grows past what the client requested.
         let p = DisplayPolicy::MirrorRetina;
         let plan = capture_plan(p, (1680, 1050), (3360, 2100), (2560, 1600), true, false);
-        assert_eq!(plan, CapturePlan { full_frame_damage: true, letterbox: false });
+        assert_eq!(
+            plan,
+            CapturePlan {
+                full_frame_damage: true,
+                letterbox: false
+            }
+        );
         let rect = aspect_fit((3360.0, 2100.0), (2560.0, 1600.0));
-        assert_eq!((rect.x, rect.y, rect.width, rect.height), (0.0, 0.0, 2560.0, 1600.0));
+        assert_eq!(
+            (rect.x, rect.y, rect.width, rect.height),
+            (0.0, 0.0, 2560.0, 1600.0)
+        );
     }
 
     #[test]
     fn retina_letterboxes_a_high_resolution_narrow_canvas() {
         let p = DisplayPolicy::MirrorRetina;
         let plan = capture_plan(p, (1680, 1050), (3360, 2100), (2400, 2000), true, false);
-        assert_eq!(plan, CapturePlan { full_frame_damage: true, letterbox: true });
+        assert_eq!(
+            plan,
+            CapturePlan {
+                full_frame_damage: true,
+                letterbox: true
+            }
+        );
         let rect = aspect_fit((3360.0, 2100.0), (2400.0, 2000.0));
         assert_eq!(rect.width, 2400.0);
         assert_eq!(rect.height, 1500.0);
@@ -194,19 +239,39 @@ mod tests {
     #[test]
     fn physical_logical_mirror_retains_old_sizing_and_stretch_opt_out() {
         let p = DisplayPolicy::MirrorLogical;
-        assert_eq!(capture_plan(p, (1680, 1050), (3360, 2100), (1920, 1080), true, false),
-            CapturePlan { full_frame_damage: true, letterbox: true });
-        assert_eq!(capture_plan(p, (1680, 1050), (3360, 2100), (1920, 1080), true, true),
-            CapturePlan { full_frame_damage: true, letterbox: false });
-        assert_eq!(capture_plan(p, (1680, 1050), (3360, 2100), (1920, 1080), false, false),
-            CapturePlan { full_frame_damage: true, letterbox: false });
+        assert_eq!(
+            capture_plan(p, (1680, 1050), (3360, 2100), (1920, 1080), true, false),
+            CapturePlan {
+                full_frame_damage: true,
+                letterbox: true
+            }
+        );
+        assert_eq!(
+            capture_plan(p, (1680, 1050), (3360, 2100), (1920, 1080), true, true),
+            CapturePlan {
+                full_frame_damage: true,
+                letterbox: false
+            }
+        );
+        assert_eq!(
+            capture_plan(p, (1680, 1050), (3360, 2100), (1920, 1080), false, false),
+            CapturePlan {
+                full_frame_damage: true,
+                letterbox: false
+            }
+        );
     }
 
     #[test]
     fn virtual_display_is_1_to_1_even_with_hidpi_flag() {
         let p = DisplayPolicy::from_flags(true, true);
-        assert_eq!(capture_plan(p, (1080, 1196), (1080, 1196), (1080, 1196), true, false),
-            CapturePlan { full_frame_damage: false, letterbox: false });
+        assert_eq!(
+            capture_plan(p, (1080, 1196), (1080, 1196), (1080, 1196), true, false),
+            CapturePlan {
+                full_frame_damage: false,
+                letterbox: false
+            }
+        );
     }
 
     #[test]

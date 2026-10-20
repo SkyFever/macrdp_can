@@ -16,17 +16,17 @@ mod auth_guard;
 mod avc444;
 mod camera;
 mod capture;
-mod display_geometry;
-mod frame_delta;
 mod clipboard;
 mod clipboard_rich;
 #[cfg(test)]
 mod conn_test;
 mod cursor;
+mod display_geometry;
 #[cfg(target_os = "macos")]
 mod file_promise;
 #[cfg(target_os = "macos")]
 mod file_promise_lazy;
+mod frame_delta;
 #[cfg(target_os = "macos")]
 mod h264;
 mod health;
@@ -3861,10 +3861,9 @@ mod hidpi_client_resolution_tests {
     use clap::Parser;
 
     fn auto(extra: &[&str]) -> bool {
-        let args = super::Args::try_parse_from(
-            std::iter::once("macrdp").chain(extra.iter().copied()),
-        )
-        .expect("valid CLI arguments");
+        let args =
+            super::Args::try_parse_from(std::iter::once("macrdp").chain(extra.iter().copied()))
+                .expect("valid CLI arguments");
         super::auto_adopt_client_resolution(&args)
     }
 
@@ -3885,7 +3884,13 @@ mod hidpi_client_resolution_tests {
 
     #[test]
     fn virtual_display_ignores_fixed_initial_width() {
-        assert!(auto(&["--virtual-display", "--width", "1920", "--height", "1080"]));
+        assert!(auto(&[
+            "--virtual-display",
+            "--width",
+            "1920",
+            "--height",
+            "1080"
+        ]));
         assert!(auto(&["--virtual-display", "--hidpi"]));
         assert!(!auto(&["--virtual-display", "--no-client-resolution"]));
     }
@@ -3898,21 +3903,22 @@ mod hidpi_client_resolution_tests {
         let args = super::Args::try_parse_from(["macrdp", "--hidpi"]).unwrap();
         assert_eq!(super::client_size_ceiling(&args, true), None);
 
-        let args = super::Args::try_parse_from([
-            "macrdp", "--hidpi", "--max-client-size", "4096x4096",
-        ]).unwrap();
+        let args =
+            super::Args::try_parse_from(["macrdp", "--hidpi", "--max-client-size", "4096x4096"])
+                .unwrap();
         assert_eq!(super::client_size_ceiling(&args, true), Some((4096, 4096)));
 
-        let args = super::Args::try_parse_from([
-            "macrdp", "--hidpi", "--max-client-size", "1920x1080",
-        ]).unwrap();
+        let args =
+            super::Args::try_parse_from(["macrdp", "--hidpi", "--max-client-size", "1920x1080"])
+                .unwrap();
         assert_eq!(super::client_size_ceiling(&args, true), Some((1920, 1080)));
 
         let args = super::Args::try_parse_from(["macrdp"]).unwrap();
         assert_eq!(super::client_size_ceiling(&args, true), None);
         let args = super::Args::try_parse_from(["macrdp", "--virtual-display", "--hidpi"]).unwrap();
         assert_eq!(super::client_size_ceiling(&args, true), None);
-        let args = super::Args::try_parse_from(["macrdp", "--hidpi", "--no-client-resolution"]).unwrap();
+        let args =
+            super::Args::try_parse_from(["macrdp", "--hidpi", "--no-client-resolution"]).unwrap();
         assert_eq!(super::client_size_ceiling(&args, false), None);
     }
 }
@@ -3922,7 +3928,11 @@ mod scaled_legacy_delta_flag_tests {
     #[test]
     fn default_enabled_and_ab_opt_out_parses() {
         use clap::Parser;
-        assert!(!super::Args::try_parse_from(["macrdp"]).unwrap().no_scaled_delta);
+        assert!(
+            !super::Args::try_parse_from(["macrdp"])
+                .unwrap()
+                .no_scaled_delta
+        );
         assert!(
             super::Args::try_parse_from(["macrdp", "--no-scaled-delta"])
                 .unwrap()

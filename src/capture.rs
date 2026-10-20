@@ -904,9 +904,8 @@ fn capture_scaling_mode(
     stretch: bool,
     policy: DisplayPolicy,
 ) -> (bool, bool) {
-    let plan = display_geometry::capture_plan(
-        policy, native, backing, configured, auto_size, stretch,
-    );
+    let plan =
+        display_geometry::capture_plan(policy, native, backing, configured, auto_size, stretch);
     (plan.full_frame_damage, plan.letterbox)
 }
 
@@ -1162,10 +1161,8 @@ mod macos {
                 display_policy,
             );
             desktop_size.set_letterbox(letterbox);
-            let detail_size = display_policy.source_dimensions(
-                (native_w, native_h),
-                (backing_w, backing_h),
-            );
+            let detail_size =
+                display_policy.source_dimensions((native_w, native_h), (backing_w, backing_h));
             tracing::info!(
                 mode = ?display_policy,
                 rdp_width = width,
@@ -1726,9 +1723,10 @@ mod macos {
                 // After that, SCK's dirty_rects tells us what changed; if the
                 // attachment is missing (older macOS, no key), fall back to
                 // the full frame.
-                let scaled_delta = self.scaled_delta.as_mut().map(|tracker| {
-                    tracker.update(src, stride_bytes, pb_width, pb_height)
-                });
+                let scaled_delta = self
+                    .scaled_delta
+                    .as_mut()
+                    .map(|tracker| tracker.update(src, stride_bytes, pb_width, pb_height));
                 let rects: Vec<(u16, u16, u16, u16)> = match scaled_delta {
                     Some(crate::frame_delta::Delta::Full) => {
                         self.delta_full += 1;
@@ -1759,10 +1757,9 @@ mod macos {
                                     let h = size.height.max(0.0).round() as u32;
                                     let x = u16::try_from(x.min(u32::from(pb_width))).ok()?;
                                     let y = u16::try_from(y.min(u32::from(pb_height))).ok()?;
-                                    let w = u16::try_from(
-                                        w.min(u32::from(pb_width.saturating_sub(x))),
-                                    )
-                                    .ok()?;
+                                    let w =
+                                        u16::try_from(w.min(u32::from(pb_width.saturating_sub(x))))
+                                            .ok()?;
                                     let h = u16::try_from(
                                         h.min(u32::from(pb_height.saturating_sub(y))),
                                     )
@@ -1914,10 +1911,19 @@ mod tests {
 
     #[test]
     fn retina_ceiling_applies_to_echoes_and_live_resize_requests() {
-        let android = DesktopSize { width: 1080, height: 1196 };
-        let retina = DesktopSize { width: 3360, height: 2100 };
+        let android = DesktopSize {
+            width: 1080,
+            height: 1196,
+        };
+        let retina = DesktopSize {
+            width: 3360,
+            height: 2100,
+        };
         assert_eq!(clamp_client_size(android, Some(retina)), android);
-        let huge = DesktopSize { width: 5000, height: 4000 };
+        let huge = DesktopSize {
+            width: 5000,
+            height: 4000,
+        };
         assert_eq!(clamp_client_size(huge, Some(retina)), retina);
         assert_eq!(clamp_client_size(huge, None), huge);
     }

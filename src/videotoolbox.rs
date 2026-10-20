@@ -106,7 +106,12 @@ impl Encoder {
             Ok("1") | Ok("true") | Ok("TRUE")
         );
         let session = ffi::create_session(
-            width, height, bitrate_bps, keyframe_frames, tx_ptr, require_hardware,
+            width,
+            height,
+            bitrate_bps,
+            keyframe_frames,
+            tx_ptr,
+            require_hardware,
         )?;
         Ok(Self {
             inner: session,
@@ -313,9 +318,12 @@ mod ffi {
         pub(super) static kVTCompressionPropertyKey_MaxFrameDelayCount: CFStringRef;
         // Read back the actual encoder chosen by VideoToolbox. A client-side
         // acceleration toggle does not prove hardware encoding on this Mac.
-        pub(super) static kVTCompressionPropertyKey_UsingHardwareAcceleratedVideoEncoder: CFStringRef;
-        pub(super) static kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder: CFStringRef;
-        pub(super) static kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder: CFStringRef;
+        pub(super) static kVTCompressionPropertyKey_UsingHardwareAcceleratedVideoEncoder:
+            CFStringRef;
+        pub(super) static kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder:
+            CFStringRef;
+        pub(super) static kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder:
+            CFStringRef;
         pub(super) static kVTProfileLevel_H264_Baseline_AutoLevel: CFStringRef;
         pub(super) static kVTEncodeFrameOptionKey_ForceKeyFrame: CFStringRef;
         // Color-space signaling so the encoded SPS VUI describes its color

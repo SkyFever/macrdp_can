@@ -1669,18 +1669,10 @@ mod macos {
         /// dropped entirely (`trace!` no-op), which — on a client that relies
         /// on it for some or all pointer motion — left the cursor unable to
         /// reach the screen edge at all.
-        fn move_rel(
-            &mut self,
-            dx: i32,
-            dy: i32,
-            desktop_w: u16,
-            desktop_h: u16,
-            letterbox: bool,
-        ) {
+        fn move_rel(&mut self, dx: i32, dy: i32, desktop_w: u16, desktop_h: u16, letterbox: bool) {
             let (ox, oy, sw, sh) = self.target_bounds();
-            let (mx, my) = super::map_client_delta_to_display(
-                dx, dy, desktop_w, desktop_h, sw, sh, letterbox,
-            );
+            let (mx, my) =
+                super::map_client_delta_to_display(dx, dy, desktop_w, desktop_h, sw, sh, letterbox);
             if self.pointer_modes_logged & 2 == 0 {
                 self.pointer_modes_logged |= 2;
                 let (scale_x, scale_y) = super::map_client_delta_to_display(

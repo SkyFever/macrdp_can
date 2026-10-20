@@ -53,10 +53,8 @@ pub fn coalesce_bitmap_rects(rects: Vec<Rect>, max_pixels: u32) -> Vec<Rect> {
     fn bounding(a: Rect, b: Rect) -> Option<Rect> {
         let left = u32::from(a.0.min(b.0));
         let top = u32::from(a.1.min(b.1));
-        let right = (u32::from(a.0) + u32::from(a.2))
-            .max(u32::from(b.0) + u32::from(b.2));
-        let bottom = (u32::from(a.1) + u32::from(a.3))
-            .max(u32::from(b.1) + u32::from(b.3));
+        let right = (u32::from(a.0) + u32::from(a.2)).max(u32::from(b.0) + u32::from(b.2));
+        let bottom = (u32::from(a.1) + u32::from(a.3)).max(u32::from(b.1) + u32::from(b.3));
         Some((
             u16::try_from(left).ok()?,
             u16::try_from(top).ok()?,
@@ -84,9 +82,7 @@ pub fn coalesce_bitmap_rects(rects: Vec<Rect>, max_pixels: u32) -> Vec<Rect> {
                 };
                 let merged_area = area(merged);
                 let dirty_area = groups[i].dirty_area + groups[j].dirty_area;
-                if merged_area > u64::from(max_pixels)
-                    || merged_area > dirty_area * MAX_OVERDRAW
-                {
+                if merged_area > u64::from(max_pixels) || merged_area > dirty_area * MAX_OVERDRAW {
                     continue;
                 }
                 let old_area = area(groups[i].rect) + area(groups[j].rect);
@@ -180,8 +176,7 @@ impl FrameDelta {
                 let differs = (y0..y1).any(|y| {
                     let src_at = y * stride + xbytes;
                     let old_at = y * row_bytes + xbytes;
-                    frame[src_at..src_at + nbytes]
-                        != self.previous[old_at..old_at + nbytes]
+                    frame[src_at..src_at + nbytes] != self.previous[old_at..old_at + nbytes]
                 });
                 if differs {
                     changed[ty * cols + tx] = true;
@@ -307,7 +302,10 @@ mod tests {
         for &(x, y) in &[(1, 1), (65, 1), (1, 65), (65, 65)] {
             paint(&mut f, stride, x, y);
         }
-        assert_eq!(d.update(&f, stride, 256, 256), Delta::Partial(vec![(0, 0, 128, 128)]));
+        assert_eq!(
+            d.update(&f, stride, 256, 256),
+            Delta::Partial(vec![(0, 0, 128, 128)])
+        );
     }
 
     #[test]
@@ -344,7 +342,6 @@ mod tests {
             assert_eq!(reconstructed, f);
         }
     }
-
 
     #[test]
     fn batching_merges_nearby_tiles_but_not_distant_regions() {
@@ -383,13 +380,14 @@ mod tests {
             }
             let original = delta.update(&f, stride, w as u16, h as u16);
             let batched = match original {
-                Delta::Partial(rects) => {
-                    Delta::Partial(coalesce_bitmap_rects(rects, 1280 * 720))
-                }
+                Delta::Partial(rects) => Delta::Partial(coalesce_bitmap_rects(rects, 1280 * 720)),
                 other => other,
             };
             apply(&mut result, &f, stride, w, h, &batched);
-            assert_eq!(result, f, "frame {step}: batching must preserve every pixel");
+            assert_eq!(
+                result, f,
+                "frame {step}: batching must preserve every pixel"
+            );
         }
     }
 
