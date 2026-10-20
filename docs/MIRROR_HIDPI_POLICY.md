@@ -10,7 +10,7 @@ the **negotiated** RDP desktop size.
 | Topology | HiDPI flag | Output resolution | Content |
 |---|---|---|---|
 | Physical mirror | off | Client-requested RDP size (unless pinned) | Existing ScreenCaptureKit scaling, aspect-fit black bars by default |
-| Physical mirror | on | Client-requested RDP size, capped by the physical display's backing pixels | Prefer backing-pixel detail; use exactly the same aspect-fit scaling/letterboxing. If the requested canvas is too small for native pixels, downsample. |
+| Physical mirror | on | Client-requested RDP size (unless explicitly capped with `--max-client-size`) | Prefer backing-pixel detail; use exactly the same aspect-fit scaling/letterboxing. If the requested canvas is too small for native pixels, downsample; if it is taller than the Retina source, pad with bars. |
 | Virtual display | either | Client-requested RDP size (or pinned virtual-display size) | Re-mode CGVirtualDisplay; use a 1:1 native capture without letterboxing |
 
 `--stretch` still opts out of black bars on auto-sized physical mirrors.
@@ -38,24 +38,29 @@ For example (physical Retina framebuffer `3360×2100`):
   All legacy tile deltas stay inside the advertised `1080×1196` bitmap.
 * Client requests `3360×2100`: the RDP desktop can be `3360×2100` and the
   physical panel's native pixels fit at 1:1 without scaling.
-* A request larger than the backing pixels is capped to the configured maximum
-  per dimension during **Demand Active**, and the same maximum is enforced on
-  Confirm Active echoes and live RDPEDISP resize requests. Aspect-fit then
-  preserves the picture without distortion.
+* Client requests `1968×2184` with a `3360×2100` Retina source: the RDP
+  desktop stays **1968×2184** (rather than being incorrectly clamped to
+  `1968×2100`). Aspect-fit produces `1968×1230` content and 477px bars at
+  the top and bottom. This avoids vertical pointer drift due to mismatched
+  client/server canvas heights on portrait Windows App.
+* A request wider or taller than the backing pixels is accepted when no
+  explicit client-size limit is configured. The content scales to fit inside
+  the announced RDP surface; the Mac's actual source pixels don't multiply.
+  An explicit `--max-client-size` is still enforced on both **Demand Active**
+  and the live RDPEDISP resize / Confirm Active paths.
 
-For the third case, padding beyond the backing-size ceiling is intentionally
-*not* negotiated: that would allocate a larger bitmap for empty bars, and
-current Windows App clients may not display oversized/renegotiated surfaces
-reliably. A future feature that negotiates a true larger canvas needs separate
-client capability tests before it can change this rule.
+The protocol limit is up to `8192×8192` and can be costly for legacy bitmaps.
+For untrusted or resource-limited deployments, operators should configure
+`MAX_CLIENT_SIZE` according to the clients they actually use. This is an
+independent resource/safety policy, not a Retina aspect-ratio constraint.
 
 ## Implementation
 
 - `src/display_geometry.rs`: `DisplayPolicy` and the common aspect-fit math.
 - `src/main.rs`: selects the topology independently of the HiDPI switch;
-  physical Retina backing is an optional ceiling, never a forced oversized
-  session. The acceptor is given the cap before Demand Active.
-- `src/capture.rs`: applies the same effective cap to Confirm Active echoes and
+  backing pixels determine source quality, and only an explicit operator cap
+  constrains the client canvas. The acceptor receives this cap (if set) before Demand Active.
+- `src/capture.rs`: applies the same explicit cap to Confirm Active echoes and
   live resize events; uses the same aspect-fit plan for scaled delta capture.
   The pre-existing 64×64 tile delta and batching are unchanged.
 - `src/input.rs`: reuses the aspect-fit rectangle when mapping mouse input from
@@ -69,14 +74,18 @@ client capability tests before it can change this rule.
    correct black bars and input, no accumulated lag.
 3. Test physical mirror with `HIDPI=1`, **same** `1080×1196` client: still serve
    `1080×1196`, no repeated stripes/frozen regions; compare pixels and latency.
-4. If a client can **request** a sufficiently large RDP desktop, test native
+4. With `HIDPI=1` and no `MAX_CLIENT_SIZE`, test Android portrait
+   `1968×2184` and landscape `2184×1968` requests against `3360×2100`
+   backing. Verify that the negotiated size matches the request on both axes,
+   with no Y drift and no oversized bitmap updates. Repeat with an explicit cap.
+5. If a client can **request** a sufficiently large RDP desktop, test native
    Retina output and a differently shaped request. Inspect where black bars
    appear and whether input coordinates remain aligned.
-5. Test `VIRTUAL_DISPLAY=1` with HiDPI both on/off: output should remain driven
+6. Test `VIRTUAL_DISPLAY=1` with HiDPI both on/off: output should remain driven
    by the virtual display's negotiated mode, never by the physical backing.
-6. Test one live window-size change and reconnect for each relevant mode;
+7. Test one live window-size change and reconnect for each relevant mode;
    confirm that no bitmap exceeds the advertised frame size.
-7. Compare `--no-scaled-delta` and `--no-scaled-delta-batching` only for
+8. Compare `--no-scaled-delta` and `--no-scaled-delta-batching` only for
    diagnostic A/B testing if artifacts remain.
 
 Unit tests only check pure policy and coordinates; real SCK/WindowServer,

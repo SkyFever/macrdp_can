@@ -29,11 +29,9 @@ impl DisplayPolicy {
         matches!(self, Self::MirrorRetina)
     }
 
-    /// Only physical Retina mirroring has an *implicit* output ceiling.
-    /// Other modes preserve their existing client-resolution negotiation.
-    pub fn implicit_ceiling(self, backing: (u16, u16)) -> Option<(u16, u16)> {
-        self.is_mirror_retina().then_some(backing)
-    }
+    // Backing-pixel dimensions determine source quality, not the negotiated
+    // RDP canvas limits. A tall portrait client's blank bars may extend past
+    // the source height without requiring any source upscaling.
 
     pub fn source_dimensions(self, logical: (u16, u16), backing: (u16, u16)) -> (u16, u16) {
         if self.is_mirror_retina() {
@@ -119,9 +117,8 @@ mod tests {
         assert_eq!(DisplayPolicy::from_flags(false, true), DisplayPolicy::MirrorRetina);
         assert_eq!(DisplayPolicy::from_flags(true, false), DisplayPolicy::Virtual);
         assert_eq!(DisplayPolicy::from_flags(true, true), DisplayPolicy::Virtual);
-        assert_eq!(DisplayPolicy::MirrorRetina.implicit_ceiling((3360, 2100)), Some((3360, 2100)));
-        assert_eq!(DisplayPolicy::Virtual.implicit_ceiling((3360, 2100)), None);
-        assert_eq!(DisplayPolicy::MirrorLogical.implicit_ceiling((3360, 2100)), None);
+        assert_eq!(DisplayPolicy::MirrorRetina.source_dimensions((1680, 1050), (3360, 2100)), (3360, 2100));
+        assert_eq!(DisplayPolicy::Virtual.source_dimensions((1680, 1050), (3360, 2100)), (1680, 1050));
     }
 
     #[test]
@@ -135,6 +132,29 @@ mod tests {
         assert!((rect.y - 260.5).abs() < 0.001);
         assert!(rect.x >= 0.0 && rect.y >= 0.0);
         assert!(rect.x + rect.width <= 1080.0 && rect.y + rect.height <= 1196.0);
+    }
+
+    #[test]
+    fn tall_portrait_client_keeps_its_full_canvas_beyond_backing_height() {
+        let source = (3360.0, 2100.0);
+        let negotiated = (1968.0, 2184.0);
+        let rect = aspect_fit(source, negotiated);
+        assert_eq!(rect.x, 0.0);
+        assert!((rect.width - 1968.0).abs() < 1e-6);
+        assert!((rect.height - 1230.0).abs() < 1e-6);
+        assert!((rect.y - 477.0).abs() < 1e-6);
+        assert!(rect.y + rect.height <= negotiated.1);
+        assert_eq!(
+            capture_plan(
+                DisplayPolicy::MirrorRetina,
+                (1680, 1050),
+                (3360, 2100),
+                (1968, 2184),
+                true,
+                false,
+            ),
+            CapturePlan { full_frame_damage: true, letterbox: true },
+        );
     }
 
     #[test]

@@ -30,9 +30,13 @@ therefore produce a `1080×1196` RDP desktop, not a forced `3360×2100` one. The
 picture fits at `1080×675` with black bars at top/bottom. Only clients that
 **request enough resolution** can receive a native-resolution pixel stream;
 `--hidpi` cannot silently turn a small Android RDP canvas into a 2× canvas.
-The Retina backing ceiling is applied consistently during Demand Active,
-Confirm Active and live RDPEDISP resizes. Full-screen high-resolution legacy
-BitmapUpdates remain substantially more expensive than reduced-size captures.
+The Retina backing size is a SOURCE dimension, not an RDP canvas ceiling.
+A portrait client may request a taller desktop just to hold black letterbox
+bars: for example, a `1968×2184` Android canvas and a `3360×2100` Mac Retina
+source yield `1968×1230` content with 477px bars above and below. Only an
+explicit `--max-client-size` constrains Demand Active, Confirm Active, and
+live RDPEDISP resizes. Full-screen high-resolution legacy BitmapUpdates
+remain substantially more expensive than reduced-size captures.
 
 Explicit `--width`/`--height` on the mirror path pins the resolution (stretch
 behavior as before). `--no-client-resolution` also fixes the initial server

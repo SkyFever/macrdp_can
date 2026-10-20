@@ -18,11 +18,12 @@ packaging side, see [../packaging/README.md](../packaging/README.md).
                           drop the connection mid-session)
 --width / --height        Override autodetected display size
 --hidpi                   Use the primary display's backing (Retina) pixels as
-                          the auto-adopt ceiling. Smaller clients get their own
-                          requested session size (Android legacy bitmap safety).
-                          Pair with --no-client-resolution to force the full
-                          backing size (unsafe for smaller clients). Ignored
-                          with --width/--height or --virtual-display. macOS-only.
+                          the mirror capture SOURCE. The RDP canvas still matches
+                          the client's requested size, including letterbox bars
+                          taller than the source. Pair with --no-client-resolution
+                          to force the initial backing size (unsafe for smaller
+                          clients). Ignored with --width/--height or --virtual-display.
+                          macOS-only.
 --no-client-resolution    Serve the Mac's native size instead of adopting the
                           resolution the client requests at connect. By default,
                           when mirroring without --width/--height (including
@@ -45,8 +46,8 @@ packaging side, see [../packaging/README.md](../packaging/README.md).
                           the protocol maximum 8192x8192 — a ~256 MB framebuffer
                           per frame. Each dimension must be in [200, 8192]. No
                           effect with --no-client-resolution or an explicit
-                          --width/--height mirror size. --hidpi automatically
-                          caps auto-adopt at backing size unless overridden.
+                          --width/--height mirror size. HiDPI does NOT imply
+                          a backing-size cap; set this explicitly to bound memory.
                           Config key: MAX_CLIENT_SIZE.
 --unminimize-on-switch    On Cmd+Tab, un-minimize the target app's window (bring
                           it back from the Dock) instead of just activating the

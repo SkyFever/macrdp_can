@@ -314,8 +314,8 @@ pub struct CaptureDisplay {
     /// client-side rescaling on mstsc costs typing latency and, with
     /// `--enable-h264`, audio desync. Enabled by default on the
     /// mirror-primary path without explicit `--width`/`--height`;
-    /// `--hidpi` still enables client-size adoption but caps the session
-    /// at the backing-pixel dimensions. `--no-client-resolution` opts out.
+    /// `--hidpi` still enables client-size adoption without restricting the
+    /// client canvas to the Mac backing pixels. `--no-client-resolution` opts out.
     ///
     /// The actual size negotiation happens in the vendored
     /// `ironrdp-acceptor` (`honor_client_desktop_size`, wired via
@@ -401,10 +401,10 @@ pub struct CaptureDisplay {
     /// path (both codec paths) and, via `virtual_display` below, on the
     /// virtual-display path.
     pub pending_resize: PendingResize,
-    /// Effective client-size ceiling (explicit `--max-client-size` OR physical
-    /// Retina backing-pixel limit), shared with the acceptor's connect-time
-    /// Demand Active negotiation. Applies to Confirm Active echoes and live
-    /// RDPEDISP resizes as well. `None` means only the protocol-size limit.
+    /// Explicit operator ceiling (`--max-client-size`), shared with the
+    /// acceptor's connect-time Demand Active negotiation. Applies to Confirm
+    /// Active echoes and live RDPEDISP resizes as well. `None` means only the
+    /// protocol-size limit.
     pub max_client_size: Option<DesktopSize>,
     /// Set by the capture loop just before it emits a server-driven
     /// `DisplayUpdate::Resize` (blank recovery's same-size reactivate, or a
